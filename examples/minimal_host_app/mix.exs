@@ -22,7 +22,7 @@ defmodule MinimalHostApp.MixProject do
     [
       {:interruptus, path: "../.."},
       {:ecto_sql, "~> 3.11"},
-      {:postgrex, "~> 0.17"}
+      {:postgrex, "~> 0.22"},
     ]
   end
 end

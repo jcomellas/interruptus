@@ -32,9 +32,13 @@ defmodule Interruptus.MixProject do
   defp deps do
     [
       {:ecto_sql, "~> 3.11"},
-      {:postgrex, "~> 0.17", only: [:dev, :test]},
+      {:postgrex, "~> 0.22", only: [:dev, :test]},
       {:jason, "~> 1.4"},
-      {:telemetry, "~> 1.2"}
+      {:telemetry, "~> 1.2"},
+      {:ex_doc, "~> 0.39", only: :dev, runtime: false},
+      {:excoveralls, "~> 0.18", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
