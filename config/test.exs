@@ -12,8 +12,8 @@ config :interruptus, Interruptus,
 
 config :interruptus, Interruptus.Test.Repo,
   database: "interruptus_test",
-  username: "postgres",
-  password: "postgres",
+  username: "interruptus",
+  password: "interruptus",
   hostname: "localhost",
   pool: Ecto.Adapters.SQL.Sandbox
 
