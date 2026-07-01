@@ -1,6 +1,19 @@
 defmodule Interruptus.Schemas.StageAttempt do
   @moduledoc """
-  Ecto schema for `interruptus_stage_attempts` table.
+  Ecto schema for the `interruptus_stage_attempts` table.
+
+  Logs each stage failure, halt, timeout, or verify outcome for observability
+  and debugging.
+
+  ## Fields
+
+    * `:workflow_id` - parent workflow instance UUID
+    * `:stage_name` - identifier for the stage that was attempted
+    * `:attempt_number` - 1-based retry counter
+    * `:outcome` - one of `:success`, `:failure`, `:suspended`, `:halted`,
+      `:timeout`, `:verify_done`, `:verify_not_done`, `:verify_failed`
+    * `:error` - optional JSON map with error details
+    * `:inserted_at` - attempt timestamp
   """
 
   use Ecto.Schema
@@ -9,6 +22,16 @@ defmodule Interruptus.Schemas.StageAttempt do
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
+
+  @type t :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          workflow_id: Ecto.UUID.t(),
+          stage_name: String.t(),
+          attempt_number: integer(),
+          outcome: atom(),
+          error: map() | nil,
+          inserted_at: DateTime.t()
+        }
 
   @outcomes ~w(success failure suspended halted timeout verify_done verify_not_done verify_failed)a
 
@@ -27,6 +50,7 @@ defmodule Interruptus.Schemas.StageAttempt do
     field :inserted_at, :utc_datetime_usec
   end
 
+  # Builds a changeset for stage attempt insert. Used by Interruptus.Runner.
   @doc false
   def changeset(attempt, attrs) do
     attempt

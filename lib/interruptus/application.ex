@@ -1,8 +1,22 @@
 defmodule Interruptus.Application do
-  @moduledoc false
+  @moduledoc """
+  OTP application callback for the `:interruptus` application.
+
+  Starts the internal supervision tree when Interruptus is listed as a
+  dependency application (library mode). Host applications typically start
+  Interruptus via `{Interruptus, repo: MyApp.Repo}` instead.
+
+  ## Supervision tree
+
+    * `Interruptus.Registry` — workflow_id → runner pid
+    * `Interruptus.RunnerSupervisor` — DynamicSupervisor for runners
+    * `Interruptus.Recovery` — periodic stale-workflow reclaim
+  """
 
   use Application
 
+  # Application start callback. Starts Interruptus.Supervisor with :one_for_one strategy.
+  @doc false
   @impl true
   def start(_type, _args) do
     children = [

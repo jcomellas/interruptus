@@ -3,6 +3,11 @@ defmodule Interruptus.Engine do
   Pure in-memory execution engine for workflow segments.
 
   Handles verify-then-run logic for checkpoint segments and individual stages.
+  Used by `Interruptus.Runner` for durable execution and by workflow `run/1`
+  for in-memory testing without persistence.
+
+  Checkpoint segments optionally call a `verify/1` function before running pipelines.
+  Verify must return `:done`, `:not_done`, or `:failed` and must be idempotent.
   """
 
   alias Interruptus.Command
@@ -16,6 +21,47 @@ defmodule Interruptus.Engine do
 
   @doc """
   Runs a single segment (verify + pipelines) against a command struct.
+
+  For checkpoint segments with a `verify` function, verify runs first:
+
+    * `:done` — skip pipelines, return `{:ok, command}`
+    * `:not_done` — run pipelines
+    * `:failed` — return `{:error, :verify_failed}`
+
+  ## Arguments
+
+    * `workflow_module` - module using `Interruptus.Workflow`
+    * `segment` - segment map from `flattened_pipelines/0`
+    * `command` - workflow command struct
+    * `opts` - execution options
+
+  ## Options
+
+    * `:timeout` - per-stage timeout in ms, or `:infinity` (default)
+
+  ## Returns
+
+    * `{:ok, command}` - segment completed successfully
+    * `{:suspend, reason, metadata, command}` - stage returned suspend tuple
+    * `{:halted, command}` - stage called `halt/2` or set `halted: true`
+    * `{:error, :verify_failed}` - verify returned `:failed`
+    * `{:error, {:invalid_verify_result, term()}}` - verify returned unexpected value
+    * `{:error, :timeout}` - stage exceeded timeout
+    * `{:error, {:invalid_stage_result, term()}}` - stage returned unexpected value
+    * `{:error, term()}` - stage task exited with reason
+
+  ## Examples
+
+      iex> command = Interruptus.Test.Support.Workflows.Simple.new(value: 5)
+      iex> segment = %{type: :stage, name: :double, verify: nil, pipelines: [:double]}
+      iex> {:ok, updated} =
+      ...>   Interruptus.Engine.run_segment(
+      ...>     Interruptus.Test.Support.Workflows.Simple,
+      ...>     segment,
+      ...>     command
+      ...>   )
+      iex> updated.data.result
+      10
   """
   @spec run_segment(module(), segment(), struct(), keyword()) ::
           {:ok, struct()}
@@ -38,7 +84,36 @@ defmodule Interruptus.Engine do
   end
 
   @doc """
-  Runs all segments from the given index to completion.
+  Runs all segments from the given index until completion, suspend, halt, or error.
+
+  ## Arguments
+
+    * `workflow_module` - module using `Interruptus.Workflow`
+    * `command` - workflow command struct
+    * `from_index` - zero-based index into `flattened_pipelines/0`
+    * `opts` - passed to `run_segment/4`
+
+  ## Returns
+
+    * `{:completed, command}` - all segments finished; command marked successful
+    * `{:suspend, reason, metadata, command, index}` - suspended at segment `index`
+    * `{:halted, command, index}` - halted at segment `index`
+    * `{:error, term()}` - verify or stage failure
+
+  ## Examples
+
+      iex> Process.put(:verify_result, :not_done)
+      iex> command = Interruptus.Test.Support.Workflows.Simple.new(value: 3)
+      iex> {:completed, result} =
+      ...>   Interruptus.Engine.run_from(
+      ...>     Interruptus.Test.Support.Workflows.Simple,
+      ...>     command,
+      ...>     0
+      ...>   )
+      iex> result.data.result
+      6
+      iex> Process.delete(:verify_result)
+      :not_done
   """
   @spec run_from(module(), struct(), non_neg_integer(), keyword()) ::
           {:completed, struct()}

@@ -2,16 +2,32 @@ defmodule Interruptus.Migration do
   @moduledoc """
   Embedded migrations for Interruptus tables.
 
-  Host applications wrap these in their own `Ecto.Migration` modules:
+  Creates `interruptus_workflows`, `interruptus_checkpoints`, and
+  `interruptus_stage_attempts` in the host database. Host applications wrap
+  these in their own `Ecto.Migration` modules:
 
-      def up, do: Interruptus.Migration.up()
-      def down, do: Interruptus.Migration.down()
+      defmodule MyApp.Repo.Migrations.AddInterruptus do
+        use Ecto.Migration
+
+        def up, do: Interruptus.Migration.up()
+        def down, do: Interruptus.Migration.down()
+      end
   """
 
   @current_version 1
 
   @doc """
   Runs all Interruptus migrations up to the current version.
+
+  Idempotent: skips versions already applied based on table presence.
+
+  ## Options
+
+    * `:version` - target version (default current library version)
+
+  ## Returns
+
+    * `:ok`
   """
   @spec up(keyword()) :: :ok
   def up(opts \\ []) do
@@ -29,6 +45,14 @@ defmodule Interruptus.Migration do
 
   @doc """
   Rolls back Interruptus migrations.
+
+  ## Options
+
+    * `:version` - target version to roll back to (default `0`, drops all tables)
+
+  ## Returns
+
+    * `:ok`
   """
   @spec down(keyword()) :: :ok
   def down(opts \\ []) do
@@ -58,6 +82,7 @@ defmodule Interruptus.Migration do
 
   defp repo, do: Ecto.Migration.repo()
 
+  # Version 1 migration: creates Interruptus tables and indexes.
   @doc false
   def up1 do
     repo().query!("""
@@ -129,6 +154,7 @@ defmodule Interruptus.Migration do
     :ok
   end
 
+  # Version 1 rollback: drops all Interruptus tables.
   @doc false
   def down1 do
     repo().query!("DROP TABLE IF EXISTS interruptus_stage_attempts")

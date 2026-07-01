@@ -1,6 +1,21 @@
 defmodule Interruptus.Config do
   @moduledoc """
   Runtime configuration for Interruptus.
+
+  Configuration is built from application env (`config :interruptus, Interruptus, ...`)
+  merged with overrides passed to `{Interruptus, repo: MyApp.Repo}` or
+  `Interruptus.Config.new/1`.
+  Stored in `:persistent_term` via `put/1` for fast access during execution.
+
+  ## Struct fields
+
+    * `:name` - config instance name atom (default `Interruptus`)
+    * `:repo` - host Ecto repo module (required)
+    * `:prefix` - PostgreSQL schema prefix (default `"public"`)
+    * `:node_id` - cluster node identifier for leases (defaults to `Node.self/0` as string)
+    * `:lease_duration` - lease TTL in milliseconds (default `30_000`)
+    * `:heartbeat_interval` - runner lease renewal interval in ms (default `10_000`)
+    * `:recovery_interval` - reclaim scan interval in ms (default `5_000`)
   """
 
   @type t :: %__MODULE__{
@@ -23,6 +38,21 @@ defmodule Interruptus.Config do
 
   @doc """
   Builds configuration from application env and optional overrides.
+
+  Merges `opts` over `Application.get_env(:interruptus, name, [])`. When
+  `:node_id` is omitted, it defaults to the current node name as a string.
+
+  ## Arguments
+
+    * `opts` - keyword list of config fields and `:name`
+
+  ## Returns
+
+    * `%Interruptus.Config{}` struct
+
+  ## Raises
+
+    * `ArgumentError` - when `struct!/2` receives unknown or invalid keys
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
@@ -40,6 +70,17 @@ defmodule Interruptus.Config do
 
   @doc """
   Fetches configuration for the given Interruptus instance name.
+
+  Reads from `:persistent_term` when previously stored via `put/1`, otherwise
+  builds a fresh config with `new/1`.
+
+  ## Arguments
+
+    * `name` - config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `%Interruptus.Config{}` struct
   """
   @spec fetch(atom()) :: t()
   def fetch(name \\ Interruptus) do
@@ -50,7 +91,17 @@ defmodule Interruptus.Config do
   end
 
   @doc """
-  Stores configuration in persistent term for fast access.
+  Stores configuration in `:persistent_term` for fast access.
+
+  Called during `Interruptus` child startup. Returns the same struct.
+
+  ## Arguments
+
+    * `config` - config struct to store
+
+  ## Returns
+
+    * The same `%Interruptus.Config{}` struct
   """
   @spec put(t()) :: t()
   def put(%__MODULE__{name: name} = config) do

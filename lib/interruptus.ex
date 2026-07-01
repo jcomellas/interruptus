@@ -2,6 +2,30 @@ defmodule Interruptus do
   @moduledoc """
   Durable Commandex-style workflow pipelines for Elixir.
 
+  Interruptus runs workflow pipelines on the BEAM with checkpoint-based durability,
+  cluster-wide exclusivity via PostgreSQL leases, and explicit suspend/resume. Workflows
+  survive process crashes and application restarts without an external orchestrator.
+
+  ## Setup
+
+  Add Interruptus to your host application supervisor:
+
+      children = [
+        MyApp.Repo,
+        {Interruptus, repo: MyApp.Repo}
+      ]
+
+  Run `Interruptus.Migration.up/0` from your Ecto migrations, then define workflows
+  with `Interruptus.Workflow` and start them via `start/3`.
+
+  ## Lifecycle
+
+  1. `start/3` inserts a `:pending` row and starts a `Interruptus.Runner`.
+  2. The runner claims the row, executes stages, and writes checkpoints.
+  3. On suspend, state is persisted and the runner stops until `resume/2`.
+  4. On crash, `Interruptus.Recovery` reclaims expired leases and restarts runners.
+  5. Terminal workflows (`:completed`, `:compensated`, `:cancelled`) are never restarted.
+
   See `Interruptus.Workflow` for defining workflows and `DESIGN.md` for architecture.
   """
 
@@ -11,7 +35,29 @@ defmodule Interruptus do
   alias Interruptus.Store
 
   @doc """
-  Child spec for the host application supervisor.
+  Returns a child spec for the host application supervisor.
+
+  Merges `opts` into `Interruptus.Config` and stores it via `Interruptus.Config.put/1`
+  when the child starts.
+
+  ## Arguments
+
+    * `opts` - keyword list of config overrides (see `Interruptus.Config`)
+
+  ## Options
+
+    * `:repo` - required Ecto repo module (e.g. `MyApp.Repo`)
+    * `:name` - config name atom (default `Interruptus`)
+    * `:prefix` - PostgreSQL schema prefix (default `"public"`)
+    * `:lease_duration` - lease TTL in ms (default `30_000`)
+    * `:heartbeat_interval` - lease renewal interval in ms (default `10_000`)
+    * `:recovery_interval` - stale-workflow scan interval in ms (default `5_000`)
+
+  ## Returns
+
+    * A supervisor child spec map suitable for `Supervisor.start_link/2`
+
+  ## Examples
 
       {Interruptus, repo: MyApp.Repo}
   """
@@ -25,6 +71,8 @@ defmodule Interruptus do
     }
   end
 
+  # Starts Interruptus and runs an initial recovery scan.
+  # Called by the supervisor via child_spec/1. Returns :ignore.
   @doc false
   def start_link(opts) do
     config = Config.new(opts) |> Config.put()
@@ -33,16 +81,32 @@ defmodule Interruptus do
   end
 
   @doc """
-  Starts a new workflow instance.
+  Starts a new workflow instance and its runner process.
+
+  Inserts a `:pending` row (with an initial checkpoint), then starts a
+  `Interruptus.Runner` under `Interruptus.RunnerSupervisor`.
+
+  ## Arguments
+
+    * `workflow_module` - module using `Interruptus.Workflow`
+    * `params` - map or keyword list of workflow parameters (JSON-serializable values)
 
   ## Options
 
-    * `:idempotency_key` - optional unique key per workflow type
-    * `:config` - Interruptus config name (default `Interruptus`)
+    * `:idempotency_key` - optional unique key per workflow type; duplicate keys
+      cause insert failure via the database unique index
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - instance row with generated `id`
+    * `{:error, %Ecto.Changeset{}}` - validation or constraint failure on insert
+    * `{:error, term()}` - runner could not be started
 
   ## Examples
 
-      Interruptus.start(MyApp.TransferFunds, %{amount: 100})
+      {:ok, instance} = Interruptus.start(MyApp.TransferFunds, %{amount: 100})
+      {:ok, instance} = Interruptus.start(MyApp.TransferFunds, amount: 100, idempotency_key: "tx-1")
   """
   @spec start(module(), map() | keyword(), keyword()) ::
           {:ok, WorkflowInstance.t()} | {:error, term()}
@@ -72,7 +136,26 @@ defmodule Interruptus do
   end
 
   @doc """
-  Resumes a suspended or reclaimable workflow.
+  Resumes a suspended or reclaimable workflow by starting a new runner.
+
+  Looks up the instance, verifies it is not terminal, resolves the workflow module
+  from `workflow_type`, and starts a runner. If a runner is already registered for
+  the workflow id, `Interruptus.RunnerSupervisor` returns the existing pid.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, pid()}` - runner process pid (new or existing)
+    * `{:error, :not_found}` - no row with that id
+    * `{:error, :terminal}` - workflow is `:completed`, `:compensated`, or `:cancelled`
+    * `{:error, term()}` - runner could not be started
   """
   @spec resume(Ecto.UUID.t(), keyword()) :: {:ok, pid()} | {:error, term()}
   def resume(workflow_id, opts \\ []) do
@@ -98,6 +181,24 @@ defmodule Interruptus do
 
   @doc """
   Cancels a non-terminal workflow.
+
+  Sets status to `:cancelled` and clears the lease (`locked_by`, `locked_until`).
+  Requires a successful optimistic lock on `lock_version`.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - updated instance with `:cancelled` status
+    * `{:error, :not_found}` - no row with that id
+    * `{:error, :terminal}` - workflow is already terminal
+    * `{:error, :stale_lock}` - another runner holds a newer `lock_version`
   """
   @spec cancel(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
   def cancel(workflow_id, opts \\ []) do
@@ -126,7 +227,21 @@ defmodule Interruptus do
   end
 
   @doc """
-  Returns the current status of a workflow instance.
+  Returns the current persisted state of a workflow instance.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - current row including `status`, `params`, `data`,
+      `current_stage_index`, lease fields, and errors
+    * `{:error, :not_found}` - no row with that id
   """
   @spec status(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, :not_found}
   def status(workflow_id, opts \\ []) do

@@ -1,6 +1,28 @@
 defmodule Interruptus.Schemas.WorkflowInstance do
   @moduledoc """
-  Ecto schema for `interruptus_workflows` table.
+  Ecto schema for the `interruptus_workflows` table.
+
+  Represents a single durable workflow execution. Params and data must be
+  JSON-serializable maps (string keys in the database).
+
+  ## Status lifecycle
+
+    * `:pending` — inserted, awaiting first claim
+    * `:running` — runner holds a lease and is executing
+    * `:suspended` — voluntarily paused; resume with `Interruptus.resume/2`
+    * `:completed` — all segments finished successfully (terminal)
+    * `:failed` — terminal failure after retries and compensation errors
+    * `:compensating` — rollback in progress
+    * `:compensated` — rollback completed (terminal)
+    * `:cancelled` — cancelled via `Interruptus.cancel/2` (terminal)
+
+  Terminal statuses (`:completed`, `:compensated`, `:cancelled`) are never restarted.
+
+  ## Lease fields
+
+    * `locked_by` — node id of the claiming runner
+    * `locked_until` — lease expiry; reclaimable when in the past
+    * `lock_version` — optimistic lock incremented on each claim/update
   """
 
   use Ecto.Schema
@@ -57,6 +79,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
     timestamps(type: :utc_datetime_usec)
   end
 
+  # Builds a changeset for insert and update. Used internally by Interruptus.Store.
   @doc false
   def changeset(instance, attrs) do
     instance
@@ -82,6 +105,26 @@ defmodule Interruptus.Schemas.WorkflowInstance do
 
   @doc """
   Returns whether the workflow is in a terminal state.
+
+  Terminal workflows cannot be resumed, cancelled again, or reclaimed.
+
+  ## Arguments
+
+    * `instance` - workflow instance struct
+
+  ## Returns
+
+    * `true` when status is `:completed`, `:compensated`, or `:cancelled`
+    * `false` otherwise
+
+  ## Examples
+
+      iex> instance = %Interruptus.Schemas.WorkflowInstance{status: :completed}
+      iex> Interruptus.Schemas.WorkflowInstance.terminal?(instance)
+      true
+      iex> instance = %Interruptus.Schemas.WorkflowInstance{status: :running}
+      iex> Interruptus.Schemas.WorkflowInstance.terminal?(instance)
+      false
   """
   @spec terminal?(t()) :: boolean()
   def terminal?(%__MODULE__{status: status}) do
@@ -90,6 +133,36 @@ defmodule Interruptus.Schemas.WorkflowInstance do
 
   @doc """
   Returns whether the workflow can be claimed for execution.
+
+  Claimable when status is `:pending`, `:suspended`, or `:running` and the
+  lease has expired (`locked_until` is `nil` or before `now`).
+
+  ## Arguments
+
+    * `instance` - workflow instance struct
+    * `_node_id` - claiming node id (reserved for future sticky assignment)
+    * `now` - reference time for lease comparison
+
+  ## Returns
+
+    * `true` when the instance may be claimed
+    * `false` otherwise
+
+  ## Examples
+
+      iex> now = ~U[2025-01-01 12:00:00Z]
+      iex> instance = %Interruptus.Schemas.WorkflowInstance{
+      ...>   status: :pending,
+      ...>   locked_until: nil
+      ...> }
+      iex> Interruptus.Schemas.WorkflowInstance.claimable?(instance, "node@host", now)
+      true
+      iex> instance = %Interruptus.Schemas.WorkflowInstance{
+      ...>   status: :running,
+      ...>   locked_until: ~U[2025-01-01 13:00:00Z]
+      ...> }
+      iex> Interruptus.Schemas.WorkflowInstance.claimable?(instance, "node@host", now)
+      false
   """
   @spec claimable?(t(), String.t(), DateTime.t()) :: boolean()
   def claimable?(%__MODULE__{status: status, locked_until: locked_until}, _node_id, now) do

@@ -1,6 +1,10 @@
 defmodule Interruptus.Recovery do
   @moduledoc """
   Scans for reclaimable workflows on boot and periodically thereafter.
+
+  Workflows with expired leases (crashed runners, network partitions) are
+  restarted by calling `Interruptus.RunnerSupervisor.start_runner/3`. Also
+  invoked synchronously when the Interruptus child starts on application boot.
   """
 
   use GenServer
@@ -8,11 +12,14 @@ defmodule Interruptus.Recovery do
   alias Interruptus.Config
   alias Interruptus.Store
 
+  # Starts the Recovery GenServer named Interruptus.Recovery.
   @doc false
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  # GenServer init callback. Schedules the first recovery scan.
+  @doc false
   @impl true
   def init(opts) do
     config = Keyword.get(opts, :config, Config.fetch())
@@ -20,6 +27,8 @@ defmodule Interruptus.Recovery do
     {:ok, %{config: config}}
   end
 
+  # Handles :recover — runs recover_all/1 and reschedules the next scan.
+  @doc false
   @impl true
   def handle_info(:recover, %{config: config} = state) do
     recover_all(config)
@@ -29,6 +38,18 @@ defmodule Interruptus.Recovery do
 
   @doc """
   Recovers all reclaimable workflows for the given config.
+
+  Queries `Interruptus.Store.list_reclaimable/1` and starts a runner for each
+  instance. Safe to call concurrently; duplicate runners are prevented by the
+  registry check in `RunnerSupervisor`.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+
+  ## Returns
+
+    * `:ok`
   """
   @spec recover_all(Config.t()) :: :ok
   def recover_all(config) do

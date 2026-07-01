@@ -1,6 +1,15 @@
 defmodule Interruptus.Test do
   @moduledoc """
   Test helpers for simulating interrupts and asserting workflow state.
+
+  Use in integration tests with Ecto SQL Sandbox and a running Interruptus
+  instance. Typical patterns:
+
+      {:ok, %{id: id}} = Interruptus.start(MyWorkflow, params)
+      assert {:ok, %{status: :completed}} = Interruptus.Test.await_status(id, :completed)
+
+      Interruptus.Test.crash_runner(id)
+      assert {:ok, %{status: :completed}} = Interruptus.Test.await_status(id, :completed)
   """
 
   alias Interruptus.Config
@@ -8,7 +17,23 @@ defmodule Interruptus.Test do
   alias Interruptus.Store
 
   @doc """
-  Waits until the workflow reaches the given status or times out.
+  Polls the database until the workflow reaches the expected status.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+    * `expected_status` - atom status to wait for (e.g. `:completed`, `:suspended`)
+
+  ## Options
+
+    * `:config` - Interruptus config (default `Interruptus.Config.fetch/0`)
+    * `:timeout` - max wait in ms (default `5_000`)
+    * `:interval` - poll interval in ms (default `50`)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - instance with matching status
+    * `{:error, :timeout}` - status not reached within timeout
   """
   @spec await_status(Ecto.UUID.t(), atom(), keyword()) ::
           {:ok, Interruptus.Schemas.WorkflowInstance.t()} | {:error, :timeout}
@@ -38,6 +63,18 @@ defmodule Interruptus.Test do
 
   @doc """
   Kills the runner process for a workflow to simulate a crash.
+
+  After the lease expires, `Interruptus.Recovery` should reclaim and restart
+  execution. Use with `await_status/3` to verify recovery behavior.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+
+  ## Returns
+
+    * `:ok` - runner was killed
+    * `{:error, :not_running}` - no runner registered for this id
   """
   @spec crash_runner(Ecto.UUID.t()) :: :ok | {:error, :not_running}
   def crash_runner(workflow_id) do
@@ -52,7 +89,21 @@ defmodule Interruptus.Test do
   end
 
   @doc """
-  Asserts the workflow has a checkpoint at the given stage index.
+  Asserts that a checkpoint row exists at the given stage index.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+    * `stage_index` - zero-based checkpoint index
+
+  ## Options
+
+    * `:config` - Interruptus config (default `Interruptus.Config.fetch/0`)
+
+  ## Returns
+
+    * `:ok` - checkpoint found
+    * `{:error, :checkpoint_not_found}` - no matching checkpoint row
   """
   @spec assert_checkpoint(Ecto.UUID.t(), non_neg_integer(), keyword()) ::
           :ok | {:error, term()}

@@ -1,6 +1,18 @@
 defmodule Interruptus.Runner do
   @moduledoc """
   GenServer that executes a workflow instance with checkpoint persistence.
+
+  One runner exists per active workflow id, registered in `Interruptus.Registry`.
+  The execution loop:
+
+  1. **Claim** — acquire lease via `Interruptus.Claim.acquire/2`
+  2. **Execute** — run segments from `current_stage_index` via `Interruptus.Engine`
+  3. **Checkpoint** — persist state after each checkpoint segment
+  4. **Heartbeat** — renew lease on interval from config
+  5. **Complete / Suspend / Fail** — terminal transitions with telemetry
+
+  On failure, applies `Interruptus.Policy.Restart` then `Interruptus.Policy.Rollback`
+  when retries are exhausted.
   """
 
   use GenServer
@@ -13,11 +25,14 @@ defmodule Interruptus.Runner do
   alias Interruptus.Schemas.WorkflowInstance
   alias Interruptus.Store
 
+  # Starts a runner GenServer. Options: :config, :workflow_module, :workflow_id.
   @doc false
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  # GenServer init: registers in Registry, trap_exit, schedules :run.
+  @doc false
   @impl true
   def init(opts) do
     config = Keyword.fetch!(opts, :config)
@@ -39,11 +54,15 @@ defmodule Interruptus.Runner do
      }}
   end
 
+  # Handles :run — begins or resumes the claim-and-execute loop.
+  @doc false
   @impl true
   def handle_info(:run, state) do
     {:noreply, execute(state)}
   end
 
+  # Handles :heartbeat — renews the lease or stops if renewal fails.
+  @doc false
   def handle_info(:heartbeat, %{config: config, instance: %WorkflowInstance{} = instance} = state) do
     case Claim.renew(config, instance) do
       {:ok, renewed} ->
@@ -55,19 +74,27 @@ defmodule Interruptus.Runner do
     end
   end
 
+  # Handles {:retry, attempt} — schedules another execution after backoff.
+  @doc false
   def handle_info({:retry, attempt}, state) do
     send(self(), :run)
     {:noreply, put_in(state.instance.attempt_count, attempt)}
   end
 
+  # Handles :stop — normal shutdown after completion or compensation.
+  @doc false
   def handle_info(:stop, state) do
     {:stop, :normal, state}
   end
 
+  # Handles linked process exits without stopping the runner.
+  @doc false
   def handle_info({:EXIT, _pid, _reason}, state) do
     {:noreply, state}
   end
 
+  # GenServer terminate: releases lease and emits telemetry.
+  @doc false
   @impl true
   def terminate(_reason, %{config: config, instance: %WorkflowInstance{} = instance}) do
     :telemetry.execute(
@@ -80,6 +107,7 @@ defmodule Interruptus.Runner do
     :ok
   end
 
+  @doc false
   def terminate(_reason, _state), do: :ok
 
   defp execute(

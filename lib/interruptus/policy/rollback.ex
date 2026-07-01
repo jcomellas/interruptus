@@ -1,12 +1,48 @@
 defmodule Interruptus.Policy.Rollback do
   @moduledoc """
   Rollback policy: LIFO compensation invocation on terminal failure.
+
+  When restart attempts are exhausted, compensation functions from
+  `rollback_policy/0` run in reverse definition order. Each function receives
+  the current command struct and must return an updated struct or error tuple.
   """
 
   @doc """
   Runs compensation functions in LIFO order.
 
-  Compensation entries may be atoms (module function names) or arity-1 functions.
+  ## Arguments
+
+    * `workflow_module` - module using `Interruptus.Workflow`
+    * `command` - command struct at failure time
+    * `compensate_fns` - list of atoms (module function names) or arity-1 functions
+
+  ## Returns
+
+    * `{:ok, command}` - all compensations succeeded
+    * `{:error, term()}` - first compensation failure or invalid return value
+
+  ## Examples
+
+      iex> defmodule CompensateExample do
+      ...>   def step1(cmd), do: %{cmd | data: Map.put(cmd.data, :undone, true)}
+      ...>   def step2(cmd), do: cmd
+      ...> end
+      iex> cmd = %Interruptus.Test.Support.Workflows.Simple{
+      ...>   data: %{result: 10},
+      ...>   params: %{value: 5},
+      ...>   errors: %{},
+      ...>   halted: false,
+      ...>   success: false,
+      ...>   pipelines: []
+      ...> }
+      iex> {:ok, result} =
+      ...>   Interruptus.Policy.Rollback.compensate(
+      ...>     CompensateExample,
+      ...>     cmd,
+      ...>     [:step1, :step2]
+      ...>   )
+      iex> result.data.undone
+      true
   """
   @spec compensate(module(), struct(), [atom() | (struct() -> struct())]) ::
           {:ok, struct()} | {:error, term()}

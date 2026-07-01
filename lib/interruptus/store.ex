@@ -1,6 +1,9 @@
 defmodule Interruptus.Store do
   @moduledoc """
   Persistence layer for workflow instances, checkpoints, and stage attempts.
+
+  All functions take an `Interruptus.Config` as the first argument and operate
+  through `Interruptus.Repo` against the host application's database.
   """
 
   import Ecto.Query
@@ -13,6 +16,19 @@ defmodule Interruptus.Store do
 
   @doc """
   Inserts a new workflow instance with an initial checkpoint.
+
+  Runs in a transaction: inserts the instance row, then writes a checkpoint
+  snapshot at `current_stage_index`.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `attrs` - map of workflow instance attributes (see `WorkflowInstance` schema)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - inserted instance
+    * `{:error, %Ecto.Changeset{}}` - validation or constraint failure
   """
   @spec insert_workflow(Config.t(), map()) ::
           {:ok, WorkflowInstance.t()} | {:error, Ecto.Changeset.t()}
@@ -31,7 +47,17 @@ defmodule Interruptus.Store do
   end
 
   @doc """
-  Fetches a workflow by id.
+  Fetches a workflow instance by id.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `id` - workflow UUID
+
+  ## Returns
+
+    * `%WorkflowInstance{}` when found
+    * `nil` when no row exists
   """
   @spec get(Config.t(), Ecto.UUID.t()) :: WorkflowInstance.t() | nil
   def get(config, id) do
@@ -39,7 +65,21 @@ defmodule Interruptus.Store do
   end
 
   @doc """
-  Updates workflow fields with optimistic lock on lock_version.
+  Updates workflow fields with optimistic locking on `lock_version`.
+
+  The update succeeds only when the row's `lock_version` matches the instance
+  passed in. On success, `lock_version` is incremented automatically.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `instance` - instance with current `id` and `lock_version`
+    * `attrs` - map of fields to update
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - freshly loaded row after update
+    * `{:error, :stale_lock}` - another process updated the row first
   """
   @spec update_with_lock(Config.t(), WorkflowInstance.t(), map()) ::
           {:ok, WorkflowInstance.t()} | {:error, :stale_lock | Ecto.Changeset.t()}
@@ -64,6 +104,19 @@ defmodule Interruptus.Store do
 
   @doc """
   Writes a checkpoint snapshot for the workflow.
+
+  Persists `params`, `data`, and `stage_index` from the current instance state
+  into `interruptus_checkpoints`.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `instance` - workflow instance to snapshot
+
+  ## Returns
+
+    * `{:ok, %Checkpoint{}}` - inserted checkpoint row
+    * `{:error, %Ecto.Changeset{}}` - validation failure
   """
   @spec write_checkpoint(Config.t(), WorkflowInstance.t()) ::
           {:ok, Checkpoint.t()} | {:error, Ecto.Changeset.t()}
@@ -72,7 +125,18 @@ defmodule Interruptus.Store do
   end
 
   @doc """
-  Logs a stage attempt.
+  Logs a stage attempt outcome.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `attrs` - map with `:workflow_id`, `:stage_name`, `:attempt_number`, `:outcome`,
+      and optional `:error`
+
+  ## Returns
+
+    * `{:ok, %StageAttempt{}}` - inserted attempt row
+    * `{:error, %Ecto.Changeset{}}` - validation failure
   """
   @spec log_attempt(Config.t(), map()) ::
           {:ok, StageAttempt.t()} | {:error, Ecto.Changeset.t()}
@@ -83,7 +147,19 @@ defmodule Interruptus.Store do
   end
 
   @doc """
-  Lists workflows that are reclaimable (non-terminal, expired lease).
+  Lists workflows that are reclaimable after lease expiry.
+
+  Returns non-terminal workflows (`:pending`, `:suspended`, `:running`) whose
+  `locked_until` is `nil` or in the past. Used by `Interruptus.Recovery`.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `now` - reference time for lease comparison (default `DateTime.utc_now/0`)
+
+  ## Returns
+
+    * List of `%WorkflowInstance{}`, ordered by `inserted_at`, limited to 100 rows
   """
   @spec list_reclaimable(Config.t(), DateTime.t()) :: [WorkflowInstance.t()]
   def list_reclaimable(config, now \\ DateTime.utc_now()) do

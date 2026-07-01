@@ -1,6 +1,17 @@
 defmodule Interruptus.Schemas.Checkpoint do
   @moduledoc """
-  Ecto schema for `interruptus_checkpoints` table.
+  Ecto schema for the `interruptus_checkpoints` table.
+
+  Historical audit trail of workflow state at each checkpoint boundary.
+  A row is written when a checkpoint segment completes and on initial insert.
+
+  ## Fields
+
+    * `:workflow_id` - parent workflow instance UUID
+    * `:stage_index` - `current_stage_index` at snapshot time
+    * `:params` - serialized workflow params (JSONB)
+    * `:data` - serialized workflow data (JSONB)
+    * `:inserted_at` - snapshot timestamp
   """
 
   use Ecto.Schema
@@ -9,6 +20,15 @@ defmodule Interruptus.Schemas.Checkpoint do
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
+
+  @type t :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          workflow_id: Ecto.UUID.t(),
+          stage_index: integer(),
+          params: map(),
+          data: map(),
+          inserted_at: DateTime.t()
+        }
 
   schema "interruptus_checkpoints" do
     field :stage_index, :integer
@@ -24,6 +44,7 @@ defmodule Interruptus.Schemas.Checkpoint do
     field :inserted_at, :utc_datetime_usec
   end
 
+  # Builds a changeset for checkpoint insert. Used by Interruptus.Store.
   @doc false
   def changeset(checkpoint, attrs) do
     checkpoint
