@@ -13,7 +13,6 @@ defmodule Interruptus.MixProject do
       deps: deps(),
       aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env()),
-      dialyzer: [plt_add_apps: [:ex_unit]],
       package: package(),
       docs: docs()
     ]
