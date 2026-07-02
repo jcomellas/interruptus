@@ -31,6 +31,7 @@ defmodule Interruptus.MixProject do
   defp deps do
     [
       {:ecto_sql, "~> 3.11"},
+      {:decimal, "~> 3.0"},
       {:postgrex, "~> 0.22", only: [:dev, :test]},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},

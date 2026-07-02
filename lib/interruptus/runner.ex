@@ -17,6 +17,8 @@ defmodule Interruptus.Runner do
 
   use GenServer
 
+  require Logger
+
   alias Interruptus.Claim
   alias Interruptus.Config
   alias Interruptus.Engine
@@ -24,6 +26,7 @@ defmodule Interruptus.Runner do
   alias Interruptus.Policy.Rollback
   alias Interruptus.Schemas.WorkflowInstance
   alias Interruptus.Store
+  alias Interruptus.Workflow.CastError
 
   @typep state :: %{
            config: Config.t(),
@@ -132,7 +135,7 @@ defmodule Interruptus.Runner do
   @spec execute(state()) :: state()
   defp execute(%{config: config, workflow_module: workflow_module, workflow_id: workflow_id} = state) do
     with {:ok, instance} <- Claim.acquire(config, workflow_id),
-         command <- build_command(workflow_module, instance) do
+         {:ok, command} <- build_command(workflow_module, instance) do
       schedule_heartbeat(config)
 
       :telemetry.execute(
@@ -145,6 +148,9 @@ defmodule Interruptus.Runner do
       |> Map.put(:instance, instance)
       |> run_loop(command, instance.current_stage_index)
     else
+      {:error, %CastError{} = error, instance} ->
+        fail_on_cast_error(%{state | instance: instance}, error)
+
       {:error, _} ->
         state
     end
@@ -182,16 +188,17 @@ defmodule Interruptus.Runner do
 
   @spec checkpoint_and_continue(state(), workflow_command(), non_neg_integer()) :: state()
   defp checkpoint_and_continue(state, command, next_index) do
-    %{config: config, instance: instance} = state
+    %{config: config, instance: instance, workflow_module: workflow_module} = state
 
-    attrs = %{
-      params: stringify_keys(command.params),
-      data: stringify_keys(command.data),
-      current_stage_index: next_index,
-      errors: command.errors
-    }
-
-    with {:ok, updated_instance} <- Store.update_with_lock(config, instance, attrs),
+    with {:ok, params} <- workflow_module.dump_params(command.params),
+         {:ok, data} <- workflow_module.dump_data(command.data),
+         {:ok, updated_instance} <-
+           Store.update_with_lock(config, instance, %{
+             params: params,
+             data: data,
+             current_stage_index: next_index,
+             errors: command.errors
+           }),
          {:ok, _} <-
            Store.write_checkpoint(config, %{updated_instance | current_stage_index: next_index}) do
       :telemetry.execute(
@@ -205,6 +212,9 @@ defmodule Interruptus.Runner do
       {:error, :stale_lock} ->
         state
 
+      {:error, %CastError{} = error} ->
+        fail_on_cast_error(state, error)
+
       {:error, _} ->
         handle_failure(state, command, :checkpoint_failed)
     end
@@ -214,26 +224,29 @@ defmodule Interruptus.Runner do
   defp complete_workflow(state, command) do
     %{config: config, instance: instance, workflow_module: workflow_module} = state
 
-    attrs = %{
-      status: :completed,
-      params: stringify_keys(command.params),
-      data: stringify_keys(command.data),
-      current_stage_index: workflow_module.flattened_pipelines() |> length(),
-      locked_by: nil,
-      locked_until: nil,
-      errors: %{}
-    }
+    with {:ok, params} <- workflow_module.dump_params(command.params),
+         {:ok, data} <- workflow_module.dump_data(command.data),
+         {:ok, completed} <-
+           Store.update_with_lock(config, instance, %{
+             status: :completed,
+             params: params,
+             data: data,
+             current_stage_index: workflow_module.flattened_pipelines() |> length(),
+             locked_by: nil,
+             locked_until: nil,
+             errors: %{}
+           }) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :completed],
+        %{},
+        %{workflow_id: completed.id}
+      )
 
-    case Store.update_with_lock(config, instance, attrs) do
-      {:ok, completed} ->
-        :telemetry.execute(
-          [:interruptus, :workflow, :completed],
-          %{},
-          %{workflow_id: completed.id}
-        )
-
-        Process.send(self(), :stop, [])
-        %{state | instance: completed}
+      Process.send(self(), :stop, [])
+      %{state | instance: completed}
+    else
+      {:error, %CastError{} = error} ->
+        fail_on_cast_error(state, error)
 
       {:error, _} ->
         state
@@ -242,29 +255,32 @@ defmodule Interruptus.Runner do
 
   @spec suspend_workflow(state(), workflow_command(), term(), map(), non_neg_integer()) :: state()
   defp suspend_workflow(state, command, reason, metadata, index) do
-    %{config: config, instance: instance} = state
+    %{config: config, instance: instance, workflow_module: workflow_module} = state
 
-    attrs = %{
-      status: :suspended,
-      current_stage_index: index,
-      params: stringify_keys(command.params),
-      data: stringify_keys(command.data),
-      suspend_reason: to_string(reason),
-      suspend_metadata: metadata,
-      locked_by: nil,
-      locked_until: nil
-    }
+    with {:ok, params} <- workflow_module.dump_params(command.params),
+         {:ok, data} <- workflow_module.dump_data(command.data),
+         {:ok, suspended} <-
+           Store.update_with_lock(config, instance, %{
+             status: :suspended,
+             current_stage_index: index,
+             params: params,
+             data: data,
+             suspend_reason: to_string(reason),
+             suspend_metadata: metadata,
+             locked_by: nil,
+             locked_until: nil
+           }) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :suspended],
+        %{},
+        %{workflow_id: suspended.id, reason: reason}
+      )
 
-    case Store.update_with_lock(config, instance, attrs) do
-      {:ok, suspended} ->
-        :telemetry.execute(
-          [:interruptus, :workflow, :suspended],
-          %{},
-          %{workflow_id: suspended.id, reason: reason}
-        )
-
-        Process.send(self(), :stop, [])
-        %{state | instance: suspended}
+      Process.send(self(), :stop, [])
+      %{state | instance: suspended}
+    else
+      {:error, %CastError{} = error} ->
+        fail_on_cast_error(state, error)
 
       {:error, _} ->
         state
@@ -272,6 +288,10 @@ defmodule Interruptus.Runner do
   end
 
   @spec handle_failure(state(), workflow_command(), term()) :: state()
+  defp handle_failure(state, _command, %CastError{} = reason) do
+    fail_on_cast_error(state, reason)
+  end
+
   defp handle_failure(state, command, reason) do
     %{config: config, workflow_module: workflow_module, instance: instance} = state
     policy = workflow_module.restart_policy()
@@ -347,31 +367,54 @@ defmodule Interruptus.Runner do
     end
   end
 
-  @spec build_command(module(), WorkflowInstance.t()) :: workflow_command()
+  @spec build_command(module(), WorkflowInstance.t()) ::
+          {:ok, workflow_command()} | {:error, CastError.t(), WorkflowInstance.t()}
   defp build_command(workflow_module, %WorkflowInstance{} = instance) do
-    params =
-      instance.params
-      |> atomize_keys()
-      |> Enum.map(fn {k, v} -> {k, v} end)
+    with {:ok, params} <- workflow_module.load_params(instance.params),
+         {:ok, loaded_data} <- workflow_module.load_data(instance.data) do
+      base = struct(workflow_module)
 
-    workflow_module.new(params)
-    |> Map.put(:data, Map.merge(workflow_module.new([]).data, atomize_keys(instance.data)))
-    |> Map.put(:errors, instance.errors)
+      command = %{
+        base
+        | params: Map.merge(base.params, params),
+          data: Map.merge(base.data, loaded_data),
+          errors: instance.errors
+      }
+
+      {:ok, command}
+    else
+      {:error, %CastError{} = error} ->
+        {:error, error, instance}
+    end
   end
 
-  @spec atomize_keys(map()) :: map()
-  defp atomize_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {k, v} when is_binary(k) ->
-        try do
-          {String.to_existing_atom(k), v}
-        rescue
-          ArgumentError -> {String.to_atom(k), v}
-        end
+  @spec fail_on_cast_error(state(), CastError.t()) :: state()
+  defp fail_on_cast_error(%{config: config, instance: %WorkflowInstance{} = instance} = state, error) do
+    Logger.error(
+      "workflow cast error workflow_id=#{instance.id} field=#{error.field} operation=#{error.operation}: #{error.message}"
+    )
 
-      {k, v} ->
-        {k, v}
-    end)
+    :telemetry.execute(
+      [:interruptus, :workflow, :cast_failed],
+      %{},
+      %{
+        workflow_id: instance.id,
+        field: error.field,
+        operation: error.operation,
+        reason: error.reason
+      }
+    )
+
+    _ =
+      Store.update_with_lock(config, instance, %{
+        status: :failed,
+        locked_by: nil,
+        locked_until: nil,
+        errors: Map.put(instance.errors, "cast", CastError.encode(error))
+      })
+
+    Process.send(self(), :stop, [])
+    state
   end
 
   @spec schedule_heartbeat(Config.t()) :: reference()
@@ -390,12 +433,4 @@ defmodule Interruptus.Runner do
   defp outcome_for(:timeout), do: :timeout
   defp outcome_for(:verify_failed), do: :verify_failed
   defp outcome_for(_), do: :failure
-
-  @spec stringify_keys(map()) :: map()
-  defp stringify_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
-      {k, v} -> {k, v}
-    end)
-  end
 end

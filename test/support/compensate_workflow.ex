@@ -4,8 +4,8 @@ defmodule Interruptus.Test.Support.CompensateWorkflow do
   use Interruptus.Workflow
 
   workflow do
-    param(:id)
-    data(:value)
+    param(:id, :string)
+    data(:value, :integer)
   end
 
   def compensate_a(command) do

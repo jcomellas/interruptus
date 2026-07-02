@@ -6,12 +6,12 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
   use Interruptus.Workflow
 
   workflow do
-    param :from_account_id
-    param :to_account_id
-    param :amount
+    param :from_account_id, :integer
+    param :to_account_id, :integer
+    param :amount, :decimal
 
-    data :debit_ref
-    data :credit_ref
+    data :debit_ref, :string
+    data :credit_ref, :string
 
     pipeline :validate_accounts
 
@@ -32,7 +32,7 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
   end
 
   def validate_accounts(command, params, _data) do
-    if params.amount > 0 do
+    if Decimal.compare(params.amount, Decimal.new(0)) == :gt do
       command
     else
       command |> Interruptus.Command.put_error(:amount, :invalid) |> Interruptus.Command.halt()

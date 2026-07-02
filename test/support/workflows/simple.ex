@@ -4,9 +4,9 @@ defmodule Interruptus.Test.Support.Workflows.Simple do
   use Interruptus.Workflow
 
   workflow do
-    param(:value)
+    param(:value, :integer)
 
-    data(:result)
+    data(:result, :integer)
 
     pipeline(:double)
 

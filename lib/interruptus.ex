@@ -1,6 +1,6 @@
 defmodule Interruptus do
   @moduledoc """
-  Durable Commandex-style workflow pipelines for Elixir.
+  Durable workflow pipelines for Elixir with typed params and data.
 
   Interruptus runs workflow pipelines on the BEAM with checkpoint-based durability,
   cluster-wide exclusivity via PostgreSQL leases, and explicit suspend/resume. Workflows
@@ -116,17 +116,19 @@ defmodule Interruptus do
   def start(workflow_module, params, opts \\ []) do
     config = config_from_opts(opts)
 
-    attrs = %{
-      workflow_type: workflow_module |> Module.split() |> Enum.join("."),
-      status: :pending,
-      params: normalize_map(params),
-      data: %{},
-      current_stage_index: 0,
-      pipeline_version: workflow_module.pipeline_version(),
-      idempotency_key: Keyword.get(opts, :idempotency_key)
-    }
-
-    with {:ok, instance} <- Store.insert_workflow(config, attrs),
+    with {:ok, cast_params} <- workflow_module.cast_params(params),
+         {:ok, dumped_params} <- workflow_module.dump_params(cast_params),
+         {:ok, dumped_data} <- workflow_module.dump_data(%{}),
+         {:ok, instance} <-
+           Store.insert_workflow(config, %{
+             workflow_type: workflow_module |> Module.split() |> Enum.join("."),
+             status: :pending,
+             params: dumped_params,
+             data: dumped_data,
+             current_stage_index: 0,
+             pipeline_version: workflow_module.pipeline_version(),
+             idempotency_key: Keyword.get(opts, :idempotency_key)
+           }),
          {:ok, _pid} <- RunnerSupervisor.start_runner(config, workflow_module, instance.id) do
       :telemetry.execute(
         [:interruptus, :workflow, :started],
@@ -266,15 +268,5 @@ defmodule Interruptus do
   @spec module_from_type(String.t()) :: module()
   defp module_from_type(type) do
     type |> String.split(".") |> Module.concat()
-  end
-
-  @spec normalize_map(keyword() | map()) :: map()
-  defp normalize_map(params) when is_list(params), do: params |> Map.new() |> normalize_map()
-
-  defp normalize_map(params) when is_map(params) do
-    Map.new(params, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
-      {k, v} -> {k, v}
-    end)
   end
 end

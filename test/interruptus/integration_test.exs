@@ -6,6 +6,7 @@ defmodule Interruptus.IntegrationTest do
   alias Interruptus.Test
   alias Interruptus.Test.Support.Workflows.Simple
   alias Interruptus.Test.Support.Workflows.Suspendable
+  alias Interruptus.Test.Support.Workflows.DumpFail
 
   setup do
     Process.delete(:last_saved)
@@ -23,6 +24,34 @@ defmodule Interruptus.IntegrationTest do
 
     assert {:ok, %{status: :completed, data: %{"result" => 8}}} =
              Test.await_status(instance.id, :completed, config: config)
+  end
+
+  test "start rejects invalid params", %{config: config} do
+    assert {:error, %Ecto.Changeset{}} = Interruptus.start(Simple, %{}, config: config.name)
+  end
+
+  test "corrupt persisted params fail workflow on reclaim", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Simple",
+        status: :pending,
+        params: %{"value" => "not-a-number"},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1
+      })
+
+    assert {:ok, _pid} = Interruptus.RunnerSupervisor.start_runner(config, Simple, instance.id)
+
+    assert {:ok, %{status: :failed}} =
+             Test.await_status(instance.id, :failed, config: config, timeout: 5_000)
+  end
+
+  test "invalid data dump fails workflow at checkpoint", %{config: config} do
+    assert {:ok, instance} = Interruptus.start(DumpFail, %{value: 1}, config: config.name)
+
+    assert {:ok, %{status: :failed}} =
+             Test.await_status(instance.id, :failed, config: config, timeout: 5_000)
   end
 
   setup do

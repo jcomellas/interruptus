@@ -6,9 +6,9 @@ defmodule Interruptus.Test.Support.Workflows.Suspendable do
   alias Interruptus.Command
 
   workflow do
-    param(:token)
+    param(:token, :string)
 
-    data(:step)
+    data(:step, :integer)
 
     pipeline(:step_one)
 

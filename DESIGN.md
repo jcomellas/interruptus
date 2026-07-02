@@ -8,7 +8,7 @@ Business workflows in Elixir applications often combine multiple steps with exte
 
 ## Goals
 
-1. Commandex-compatible authoring experience (`param`, `data`, `pipeline`, halt/errors).
+1. Commandex-compatible authoring experience (`pipeline`, halt/errors) with typed `param/3` and `data/3`.
 2. Checkpoint segments with idempotent `verify/1` reconciliation between boundaries.
 3. Embedded persistence in the host application's database (Oban-style migrations).
 4. Per-workflow-instance supervision with crash recovery.
@@ -39,7 +39,7 @@ Business workflows in Elixir applications often combine multiple steps with exte
 
 ### Workflow
 
-A module using `Interruptus.Workflow` that defines params, data fields, pipeline stages, checkpoint segments, and policies. Compiled metadata drives the `Interruptus.Engine` and `Interruptus.Runner`.
+A module using `Interruptus.Workflow` that defines typed params, data fields, pipeline stages, checkpoint segments, and policies. Compiled metadata drives the `Interruptus.Engine` and `Interruptus.Runner`. Each workflow generates embedded Ecto schemas for cast/load/dump at persistence boundaries.
 
 ### Stage
 

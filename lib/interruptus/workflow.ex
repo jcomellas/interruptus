@@ -2,8 +2,8 @@ defmodule Interruptus.Workflow do
   @moduledoc """
   Macro DSL for defining durable workflows.
 
-  Workflows are Commandex-compatible: they define `param`, `data`, and `pipeline`
-  stages, plus `checkpoint` segments with optional `verify` functions and policies.
+  Workflows define typed `param`, `data`, and `pipeline` stages, plus `checkpoint`
+  segments with optional `verify` functions and policies.
 
   ## Example
 
@@ -11,12 +11,12 @@ defmodule Interruptus.Workflow do
         use Interruptus.Workflow
 
         workflow do
-          param :from_account_id
-          param :to_account_id
-          param :amount
+          param :from_account_id, :integer
+          param :to_account_id, :integer
+          param :amount, :decimal
 
-          data :debit_ref
-          data :credit_ref
+          data :debit_ref, :string
+          data :credit_ref, :string
 
           pipeline :validate_accounts
 
@@ -41,6 +41,10 @@ defmodule Interruptus.Workflow do
         def verify_debit_applied(command), do: :not_done
         # ...
       end
+
+  Params are cast at `Interruptus.start/3` and `new/1`. Data is validated when
+  persisted to JSONB (dump-then-cast). Unset (`nil`) fields are omitted from
+  stored JSON. Invalid load/dump fails the workflow.
 
   Start durable execution with `Interruptus.start/3` or run in-memory with `run/1`.
 
@@ -108,7 +112,7 @@ defmodule Interruptus.Workflow do
   ## Examples
 
       workflow do
-        param :amount
+        param :amount, :decimal
         pipeline :charge
       end
   """
@@ -121,47 +125,52 @@ defmodule Interruptus.Workflow do
   end
 
   @doc """
-  Declares a workflow parameter with an optional default.
+  Declares a typed workflow parameter with an optional default.
 
-  Parameters are provided at `Interruptus.start/3` or `new/1` and persisted in
-  `params` on the workflow instance. Must be JSON-serializable.
+  Parameters are provided at `Interruptus.start/3` or `new/1`, cast via
+  `Ecto.Changeset`, and persisted in `params` on the workflow instance.
 
   ## Arguments
 
     * `name` - atom parameter name
-    * `opts` - keyword list
+    * `type` - `Ecto.Type` atom, `Ecto.Enum`, custom `Ecto.Type` module, or `:decimal`
+    * `opts` - keyword list passed to `field/3` (e.g. `default:`, `values:` for enums)
 
   ## Options
 
-    * `:default` - default value when not supplied at start time
+    * `:default` - default value when not supplied at start time (also marks the
+      field as optional for `validate_required` at start)
 
   ## Raises
 
     * `ArgumentError` - when the same param name is defined twice
   """
-  defmacro param(name, opts \\ []) do
+  defmacro param(name, type, opts \\ []) do
     quote do
-      Interruptus.Workflow.__param__(__MODULE__, unquote(name), unquote(opts))
+      Interruptus.Workflow.__param__(__MODULE__, unquote(name), unquote(type), unquote(opts))
     end
   end
 
   @doc """
-  Declares a workflow data field.
+  Declares a typed workflow data field.
 
   Data fields are updated by pipeline stages via `Interruptus.Command.put_data/3`
-  and persisted in `data` on the workflow instance between checkpoints.
+  and persisted in `data` on the workflow instance between checkpoints. Values are
+  validated on persist via dump-then-cast; unset (`nil`) fields are omitted from JSON.
 
   ## Arguments
 
     * `name` - atom data field name
+    * `type` - `Ecto.Type` atom, `Ecto.Enum`, custom `Ecto.Type` module, or `:decimal`
+    * `opts` - keyword list passed to `field/3`
 
   ## Raises
 
     * `ArgumentError` - when the same data name is defined twice
   """
-  defmacro data(name) do
+  defmacro data(name, type, opts \\ []) do
     quote do
-      Interruptus.Workflow.__data__(__MODULE__, unquote(name))
+      Interruptus.Workflow.__data__(__MODULE__, unquote(name), unquote(type), unquote(opts))
     end
   end
 
@@ -284,12 +293,18 @@ defmodule Interruptus.Workflow do
     rollback_policy = Module.get_attribute(env.module, :workflow_rollback_policy) || []
     pipeline_version = Module.get_attribute(env.module, :workflow_pipeline_version) || 1
 
-    param_defaults = for {name, default} <- params, into: %{}, do: {name, default}
-    data_defaults = for name <- data, into: %{}, do: {name, nil}
+    param_defaults = param_defaults_map(params)
+    data_defaults = data_defaults_map(data)
+    required_params = required_param_fields(params)
+    params_embed = generate_embedded_module(env.module, :Params, params)
+    data_embed = generate_embedded_module(env.module, :Data, data)
 
     flattened = flatten_segments(segments)
 
     quote do
+      unquote(params_embed)
+      unquote(data_embed)
+
       @behaviour Interruptus.Workflow.Behaviour
 
       defstruct success: false,
@@ -360,9 +375,69 @@ defmodule Interruptus.Workflow do
       def pipeline_version, do: unquote(pipeline_version)
 
       @doc """
+      Casts parameters and returns an atom-keyed params map.
+
+      Required params (those without `default:`) are validated. See `cast_params!/1`
+      for raising behaviour.
+      """
+      @spec cast_params(map() | Keyword.t()) :: {:ok, map()} | {:error, Ecto.Changeset.t()}
+      @impl Interruptus.Workflow.Behaviour
+      def cast_params(input) do
+        unquote(cast_params_body(params, required_params))
+      end
+
+      @doc """
+      Casts parameters or raises `Ecto.CastError`.
+      """
+      @spec cast_params!(map() | Keyword.t()) :: map()
+      def cast_params!(input) do
+        case cast_params(input) do
+          {:ok, params} -> params
+          {:error, changeset} -> raise Ecto.CastError, changeset: changeset
+        end
+      end
+
+      @doc """
+      Loads persisted params JSON into an atom-keyed map.
+      """
+      @spec load_params(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+      @impl Interruptus.Workflow.Behaviour
+      def load_params(json_map) do
+        unquote(load_params_body(params))
+      end
+
+      @doc """
+      Loads persisted data JSON into an atom-keyed map.
+      """
+      @spec load_data(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+      @impl Interruptus.Workflow.Behaviour
+      def load_data(json_map) do
+        unquote(load_data_body(data))
+      end
+
+      @doc """
+      Dumps params to a JSON-safe map with string keys. Omits `nil` fields.
+      """
+      @spec dump_params(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+      @impl Interruptus.Workflow.Behaviour
+      def dump_params(atom_map) do
+        unquote(dump_params_body(params))
+      end
+
+      @doc """
+      Dumps data to a JSON-safe map with string keys. Omits `nil` fields and
+      validates each dumped value via dump-then-cast.
+      """
+      @spec dump_data(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+      @impl Interruptus.Workflow.Behaviour
+      def dump_data(atom_map) do
+        unquote(dump_data_body(data))
+      end
+
+      @doc """
       Creates a new command struct from parameters.
 
-      Merges supplied params with defaults declared via `param/2`.
+      Casts supplied params via `cast_params!/1` and merges with declared defaults.
 
       ## Arguments
 
@@ -374,7 +449,16 @@ defmodule Interruptus.Workflow do
       """
       @spec new(map() | Keyword.t()) :: t()
       def new(opts \\ []) do
-        Interruptus.Command.parse_params(%__MODULE__{}, opts)
+        params = cast_params!(opts)
+
+        %__MODULE__{
+          success: false,
+          halted: false,
+          errors: %{},
+          params: Map.merge(unquote(Macro.escape(param_defaults)), params),
+          data: unquote(Macro.escape(data_defaults)),
+          pipelines: unquote(Macro.escape(flattened))
+        }
       end
 
       @doc """
@@ -422,31 +506,132 @@ defmodule Interruptus.Workflow do
     end
   end
 
-  # Compile-time helper for param/2. Raises ArgumentError on duplicate names.
+  # Compile-time helper for param/3. Raises ArgumentError on duplicate names.
   @doc false
-  @spec __param__(module(), atom(), keyword()) :: :ok
-  def __param__(mod, name, opts) do
+  @spec __param__(module(), atom(), term(), keyword()) :: :ok
+  def __param__(mod, name, type, opts) do
     params = Module.get_attribute(mod, :workflow_params, [])
 
     if List.keyfind(params, name, 0) do
       raise ArgumentError, "param #{inspect(name)} is already defined"
     end
 
-    default = Keyword.get(opts, :default)
-    Module.put_attribute(mod, :workflow_params, {name, default})
+    Module.put_attribute(mod, :workflow_params, {name, resolve_type(type), opts})
   end
 
-  # Compile-time helper for data/1. Raises ArgumentError on duplicate names.
+  # Compile-time helper for data/3. Raises ArgumentError on duplicate names.
   @doc false
-  @spec __data__(module(), atom()) :: :ok
-  def __data__(mod, name) do
+  @spec __data__(module(), atom(), term(), keyword()) :: :ok
+  def __data__(mod, name, type, opts) do
     data = Module.get_attribute(mod, :workflow_data, [])
 
-    if name in data do
+    if List.keyfind(data, name, 0) do
       raise ArgumentError, "data #{inspect(name)} is already defined"
     end
 
-    Module.put_attribute(mod, :workflow_data, name)
+    Module.put_attribute(mod, :workflow_data, {name, resolve_type(type), opts})
+  end
+
+  @spec resolve_type(term()) :: term()
+  defp resolve_type(:decimal), do: Interruptus.Type.Decimal
+  defp resolve_type(type), do: type
+
+  @spec param_defaults_map([{atom(), term(), keyword()}]) :: map()
+  defp param_defaults_map(params) do
+    Map.new(params, fn {name, _type, opts} -> {name, Keyword.get(opts, :default)} end)
+  end
+
+  @spec data_defaults_map([{atom(), term(), keyword()}]) :: map()
+  defp data_defaults_map(data) do
+    Map.new(data, fn {name, _type, opts} -> {name, Keyword.get(opts, :default)} end)
+  end
+
+  @spec required_param_fields([{atom(), term(), keyword()}]) :: [atom()]
+  defp required_param_fields(params) do
+    for {name, _type, opts} <- params, not Keyword.has_key?(opts, :default), do: name
+  end
+
+  @spec generate_embedded_module(module(), atom(), [{atom(), term(), keyword()}]) :: Macro.t()
+  defp generate_embedded_module(_parent, _name, []), do: nil
+
+  defp generate_embedded_module(parent, name, fields) do
+    nested_mod = Module.concat([parent, name])
+    field_names = Enum.map(fields, fn {field_name, _, _} -> field_name end)
+
+    field_asts =
+      Enum.map(fields, fn {field_name, type, opts} ->
+        quote do
+          field(unquote(field_name), unquote(Macro.escape(type)), unquote(Macro.escape(opts)))
+        end
+      end)
+
+    quote do
+      defmodule unquote(nested_mod) do
+        use Ecto.Schema
+
+        import Ecto.Changeset
+
+        @primary_key false
+        embedded_schema do
+          (unquote_splicing(field_asts))
+        end
+
+        def changeset(struct, attrs) do
+          cast(struct, attrs, unquote(field_names))
+        end
+      end
+    end
+  end
+
+  @spec cast_params_body([{atom(), term(), keyword()}], [atom()]) :: Macro.t()
+  defp cast_params_body([], _required), do: quote(do: {:ok, %{}})
+
+  defp cast_params_body(_params, required) do
+    quote do
+      Interruptus.Workflow.Fields.cast_params(__MODULE__.Params, unquote(required), input)
+    end
+  end
+
+  @spec load_params_body([{atom(), term(), keyword()}]) :: Macro.t()
+  defp load_params_body([]), do: quote(do: {:ok, %{}})
+
+  defp load_params_body(_params) do
+    quote do
+      Interruptus.Workflow.Fields.load_fields(__MODULE__.Params, json_map)
+    end
+  end
+
+  @spec load_data_body([{atom(), term(), keyword()}]) :: Macro.t()
+  defp load_data_body([]), do: quote(do: {:ok, %{}})
+
+  defp load_data_body(_data) do
+    quote do
+      Interruptus.Workflow.Fields.load_fields(__MODULE__.Data, json_map)
+    end
+  end
+
+  @spec dump_params_body([{atom(), term(), keyword()}]) :: Macro.t()
+  defp dump_params_body([]), do: quote(do: {:ok, %{}})
+
+  defp dump_params_body(_params) do
+    quote do
+      Interruptus.Workflow.Fields.dump_fields(__MODULE__.Params, atom_map,
+        omit_nil: true,
+        validate_dump: false
+      )
+    end
+  end
+
+  @spec dump_data_body([{atom(), term(), keyword()}]) :: Macro.t()
+  defp dump_data_body([]), do: quote(do: {:ok, %{}})
+
+  defp dump_data_body(_data) do
+    quote do
+      Interruptus.Workflow.Fields.dump_fields(__MODULE__.Data, atom_map,
+        omit_nil: true,
+        validate_dump: true
+      )
+    end
   end
 
   # Compile-time helper for pipeline/1.
@@ -543,6 +728,11 @@ defmodule Interruptus.Workflow.Behaviour do
   @callback restart_policy() :: Interruptus.Policy.Restart.t()
   @callback rollback_policy() :: Interruptus.Policy.Rollback.t()
   @callback pipeline_version() :: pos_integer()
+  @callback cast_params(map() | keyword()) :: {:ok, map()} | {:error, Ecto.Changeset.t()}
+  @callback load_params(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+  @callback load_data(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+  @callback dump_params(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
+  @callback dump_data(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
 end
 
 defmodule Interruptus.Workflow.Segment do

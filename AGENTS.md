@@ -2,7 +2,7 @@
 
 ## Mission
 
-Interruptus is an Elixir library that provides **Commandex-style workflow pipelines** with **checkpoint-based durability**, **multi-node exclusivity**, and **explicit suspend/resume**. It is a simpler, in-process alternative to Temporal: workflows run on the BEAM, persist state in the host application's PostgreSQL database, and resume after crashes, restarts, or voluntary suspension without requiring an external orchestrator.
+Interruptus is an Elixir library that provides **durable workflow pipelines** with **typed params and data**, **checkpoint-based durability**, **multi-node exclusivity**, and **explicit suspend/resume**. It is a simpler, in-process alternative to Temporal: workflows run on the BEAM, persist state in the host application's PostgreSQL database, and resume after crashes, restarts, or voluntary suspension without requiring an external orchestrator.
 
 ## Architecture Map
 
@@ -42,12 +42,12 @@ defmodule MyApp.TransferFunds do
   use Interruptus.Workflow
 
   workflow do
-    param :from_account_id
-    param :to_account_id
-    param :amount
+    param :from_account_id, :integer
+    param :to_account_id, :integer
+    param :amount, :decimal
 
-    data :debit_ref
-    data :credit_ref
+    data :debit_ref, :string
+    data :credit_ref, :string
 
     pipeline :validate_accounts
 
@@ -71,9 +71,17 @@ end
 
 ### Stage return values
 
-- Return the command struct (Commandex-compatible) for normal progress.
+- Return the command struct for normal progress.
 - `{:suspend, reason, metadata}` — voluntary suspension; no process held until resume.
 - `halt/1` — stop forward progress; triggers restart or rollback per policy.
+
+### Typed fields
+
+- `param :name, :type` and `data :name, :type` declare Ecto-typed fields.
+- Params are cast and validated at `Interruptus.start/3` (required unless `default:` is set).
+- Data is validated on persist (dump-then-cast); unset (`nil`) fields are omitted from JSONB.
+- `:decimal` persists as a normalized string; use `Decimal` in stage functions after load/cast.
+- Supports `Ecto.Enum` and custom `Ecto.Type` modules via field options.
 
 ### Verify functions
 
@@ -101,7 +109,7 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 
 ## Conventions
 
-- Mirror **Commandex** API: `param`, `data`, `pipeline`, `halt/1`, `put_data/3`, `put_error/3`.
+- Workflow DSL: `param/3`, `data/3`, `pipeline`, `halt/1`, `put_data/3`, `put_error/3`.
 - Mirror **Oban** embedding: `Interruptus.Migration.up/0`, `Interruptus.Repo` wrapper.
 - Module layout under `lib/interruptus/`.
 - Public API on `Interruptus` module: `start/2`, `resume/1`, `cancel/1`, `status/1`.

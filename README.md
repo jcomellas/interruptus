@@ -1,6 +1,6 @@
 # Interruptus
 
-Durable Commandex-style workflow pipelines for Elixir with checkpoint-based persistence, multi-node exclusivity, and explicit suspend/resume.
+Durable workflow pipelines for Elixir with typed params/data, checkpoint-based persistence, multi-node exclusivity, and explicit suspend/resume.
 
 ## Installation
 
@@ -53,10 +53,10 @@ defmodule MyApp.TransferFunds do
   use Interruptus.Workflow
 
   workflow do
-    param :from_account_id
-    param :amount
+    param :from_account_id, :integer
+    param :amount, :decimal
 
-    data :debit_ref
+    data :debit_ref, :string
 
     pipeline :validate
 
@@ -70,7 +70,7 @@ defmodule MyApp.TransferFunds do
   end
 end
 
-{:ok, workflow} = Interruptus.start(MyApp.TransferFunds, %{from_account_id: "a", amount: 100})
+{:ok, workflow} = Interruptus.start(MyApp.TransferFunds, %{from_account_id: 1, amount: "100.00"})
 ```
 
 See [DESIGN.md](DESIGN.md) for architecture details and [AGENTS.md](AGENTS.md) for contributor context.
