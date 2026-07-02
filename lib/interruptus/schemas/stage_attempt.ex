@@ -23,14 +23,32 @@ defmodule Interruptus.Schemas.StageAttempt do
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
+  @type outcome ::
+          :success
+          | :failure
+          | :suspended
+          | :halted
+          | :timeout
+          | :verify_done
+          | :verify_not_done
+          | :verify_failed
+
   @type t :: %__MODULE__{
           id: Ecto.UUID.t(),
           workflow_id: Ecto.UUID.t(),
           stage_name: String.t(),
           attempt_number: integer(),
-          outcome: atom(),
+          outcome: outcome(),
           error: map() | nil,
           inserted_at: DateTime.t()
+        }
+
+  @type attempt_attrs :: %{
+          required(:workflow_id) => Ecto.UUID.t(),
+          required(:stage_name) => String.t(),
+          required(:attempt_number) => pos_integer(),
+          required(:outcome) => outcome(),
+          optional(:error) => map()
         }
 
   @outcomes ~w(success failure suspended halted timeout verify_done verify_not_done verify_failed)a
@@ -52,6 +70,7 @@ defmodule Interruptus.Schemas.StageAttempt do
 
   # Builds a changeset for stage attempt insert. Used by Interruptus.Runner.
   @doc false
+  @spec changeset(Ecto.Schema.t(), map()) :: Ecto.Changeset.t()
   def changeset(attempt, attrs) do
     attempt
     |> cast(attrs, [:workflow_id, :stage_name, :attempt_number, :outcome, :error, :inserted_at])
@@ -59,6 +78,7 @@ defmodule Interruptus.Schemas.StageAttempt do
     |> put_inserted_at()
   end
 
+  @spec put_inserted_at(Ecto.Changeset.t()) :: Ecto.Changeset.t()
   defp put_inserted_at(changeset) do
     case get_field(changeset, :inserted_at) do
       nil -> put_change(changeset, :inserted_at, DateTime.utc_now())

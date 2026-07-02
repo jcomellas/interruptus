@@ -78,6 +78,7 @@ defmodule Interruptus.Migration do
     :ok
   end
 
+  @spec migrated_version(keyword()) :: non_neg_integer()
   defp migrated_version(opts) do
     prefix = Keyword.get(opts, :prefix)
 
@@ -88,6 +89,7 @@ defmodule Interruptus.Migration do
     end
   end
 
+  @spec table_exists?(String.t(), String.t() | nil) :: boolean()
   defp table_exists?(table, prefix) do
     Ecto.Adapters.SQL.table_exists?(repo(), table, prefix: prefix)
   rescue
@@ -96,6 +98,7 @@ defmodule Interruptus.Migration do
 
   # Version 1 migration: creates Interruptus tables and indexes.
   @doc false
+  @spec up1(keyword()) :: :ok
   def up1(opts \\ []) do
     prefix = Keyword.get(opts, :prefix)
     table_opts = [primary_key: false, prefix: prefix]
@@ -188,6 +191,7 @@ defmodule Interruptus.Migration do
 
   # Version 1 rollback: drops all Interruptus tables.
   @doc false
+  @spec down1(keyword()) :: :ok
   def down1(opts \\ []) do
     prefix = Keyword.get(opts, :prefix)
 

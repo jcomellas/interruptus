@@ -62,6 +62,7 @@ defmodule Interruptus do
 
       {Interruptus, repo: MyApp.Repo}
   """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     config = Config.new(opts) |> Config.put()
 
@@ -75,6 +76,7 @@ defmodule Interruptus do
   # Starts Interruptus and runs an initial recovery scan.
   # Called by the supervisor via child_spec/1. Returns :ignore.
   @doc false
+  @spec start_link(keyword()) :: :ignore
   def start_link(opts) do
     config = Config.new(opts) |> Config.put()
     Interruptus.Recovery.recover_all(config)
@@ -254,16 +256,19 @@ defmodule Interruptus do
     end
   end
 
+  @spec config_from_opts(keyword()) :: Config.t()
   defp config_from_opts(opts) do
     opts
     |> Keyword.get(:config, Interruptus)
     |> Config.fetch()
   end
 
+  @spec module_from_type(String.t()) :: module()
   defp module_from_type(type) do
     type |> String.split(".") |> Module.concat()
   end
 
+  @spec normalize_map(keyword() | map()) :: map()
   defp normalize_map(params) when is_list(params), do: params |> Map.new() |> normalize_map()
 
   defp normalize_map(params) when is_map(params) do

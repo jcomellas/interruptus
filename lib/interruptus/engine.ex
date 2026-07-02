@@ -12,12 +12,7 @@ defmodule Interruptus.Engine do
 
   alias Interruptus.Command
 
-  @type segment :: %{
-          type: :stage | :checkpoint,
-          name: atom() | nil,
-          verify: atom() | nil,
-          pipelines: [atom()]
-        }
+  @type segment :: Interruptus.Workflow.Segment.t()
 
   @doc """
   Runs a single segment (verify + pipelines) against a command struct.
@@ -63,10 +58,10 @@ defmodule Interruptus.Engine do
       iex> updated.data.result
       10
   """
-  @spec run_segment(module(), segment(), struct(), keyword()) ::
-          {:ok, struct()}
-          | {:suspend, term(), map(), struct()}
-          | {:halted, struct()}
+  @spec run_segment(module(), segment(), Command.t(), keyword()) ::
+          {:ok, Command.t()}
+          | {:suspend, term(), map(), Command.t()}
+          | {:halted, Command.t()}
           | {:error, term()}
   def run_segment(workflow_module, segment, command, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, :infinity)
@@ -115,16 +110,21 @@ defmodule Interruptus.Engine do
       iex> Process.delete(:verify_result)
       :not_done
   """
-  @spec run_from(module(), struct(), non_neg_integer(), keyword()) ::
-          {:completed, struct()}
-          | {:suspend, term(), map(), struct(), non_neg_integer()}
-          | {:halted, struct(), non_neg_integer()}
+  @spec run_from(module(), Command.t(), non_neg_integer(), keyword()) ::
+          {:completed, Command.t()}
+          | {:suspend, term(), map(), Command.t(), non_neg_integer()}
+          | {:halted, Command.t(), non_neg_integer()}
           | {:error, term()}
   def run_from(workflow_module, command, from_index, opts \\ []) do
     segments = workflow_module.flattened_pipelines()
     do_run_from(workflow_module, command, segments, from_index, opts)
   end
 
+  @spec do_run_from(module(), Command.t(), [segment()], non_neg_integer(), keyword()) ::
+          {:completed, Command.t()}
+          | {:suspend, term(), map(), Command.t(), non_neg_integer()}
+          | {:halted, Command.t(), non_neg_integer()}
+          | {:error, term()}
   defp do_run_from(_workflow_module, command, segments, index, _opts)
        when index >= length(segments) do
     {:completed, Command.maybe_mark_successful(command)}
@@ -148,6 +148,8 @@ defmodule Interruptus.Engine do
     end
   end
 
+  @spec maybe_verify(module(), segment(), Command.t()) ::
+          {:skip, Command.t()} | {:run, Command.t()} | {:error, term()}
   defp maybe_verify(_workflow_module, %{verify: nil}, command), do: {:run, command}
 
   defp maybe_verify(workflow_module, %{verify: verify}, command) do
@@ -159,6 +161,11 @@ defmodule Interruptus.Engine do
     end
   end
 
+  @spec run_pipelines(module(), [atom()], Command.t(), :infinity | pos_integer()) ::
+          {:ok, Command.t()}
+          | {:suspend, term(), map(), Command.t()}
+          | {:halted, Command.t()}
+          | {:error, term()}
   defp run_pipelines(_workflow_module, [], command, _timeout), do: {:ok, command}
 
   defp run_pipelines(workflow_module, [name | rest], command, timeout) do
@@ -178,6 +185,10 @@ defmodule Interruptus.Engine do
     end
   end
 
+  @spec run_stage(module(), atom(), Command.t(), :infinity | pos_integer()) ::
+          {:ok, Command.t()}
+          | {:suspend, term(), map(), Command.t()}
+          | {:error, term()}
   defp run_stage(_workflow_module, name, command, :infinity) do
     case Command.apply_fun(command, name) do
       {:suspend, reason, metadata} ->
@@ -185,9 +196,6 @@ defmodule Interruptus.Engine do
 
       %{} = result ->
         {:ok, result}
-
-      other ->
-        {:error, {:invalid_stage_result, other}}
     end
   end
 

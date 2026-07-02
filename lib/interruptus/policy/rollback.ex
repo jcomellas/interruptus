@@ -7,6 +7,12 @@ defmodule Interruptus.Policy.Rollback do
   the current command struct and must return an updated struct or error tuple.
   """
 
+  alias Interruptus.Command
+
+  @type t :: %{
+          compensate: [atom()]
+        }
+
   @doc """
   Runs compensation functions in LIFO order.
 
@@ -44,8 +50,8 @@ defmodule Interruptus.Policy.Rollback do
       iex> result.data.undone
       true
   """
-  @spec compensate(module(), struct(), [atom() | (struct() -> struct())]) ::
-          {:ok, struct()} | {:error, term()}
+  @spec compensate(module(), Command.t(), [atom() | (Command.t() -> Command.t())]) ::
+          {:ok, Command.t()} | {:error, term()}
   def compensate(workflow_module, command, compensate_fns) do
     compensate_fns
     |> Enum.reverse()
@@ -57,6 +63,8 @@ defmodule Interruptus.Policy.Rollback do
     end)
   end
 
+  @spec apply_compensate(module(), (Command.t() -> Command.t()) | atom(), Command.t()) ::
+          {:ok, Command.t()} | {:error, term()}
   defp apply_compensate(_workflow_module, fun, command) when is_function(fun, 1) do
     case fun.(command) do
       %{} = updated -> {:ok, updated}

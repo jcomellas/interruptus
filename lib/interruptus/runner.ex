@@ -25,14 +25,27 @@ defmodule Interruptus.Runner do
   alias Interruptus.Schemas.WorkflowInstance
   alias Interruptus.Store
 
+  @typep state :: %{
+           config: Config.t(),
+           workflow_module: module(),
+           workflow_id: Ecto.UUID.t(),
+           instance: WorkflowInstance.t() | nil
+         }
+
+  @typep workflow_command :: struct()
+
+  @typep attempt_outcome :: :halted | :timeout | :verify_failed | :failure
+
   # Starts a runner GenServer. Options: :config, :workflow_module, :workflow_id.
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
   # GenServer init: registers in Registry, trap_exit, schedules :run.
   @doc false
+  @spec init(keyword()) :: {:ok, state()}
   @impl true
   def init(opts) do
     config = Keyword.fetch!(opts, :config)
@@ -56,6 +69,7 @@ defmodule Interruptus.Runner do
 
   # Handles :run — begins or resumes the claim-and-execute loop.
   @doc false
+  @spec handle_info(:run, state()) :: {:noreply, state()}
   @impl true
   def handle_info(:run, state) do
     {:noreply, execute(state)}
@@ -63,6 +77,7 @@ defmodule Interruptus.Runner do
 
   # Handles :heartbeat — renews the lease or stops if renewal fails.
   @doc false
+  @spec handle_info(:heartbeat, state()) :: {:noreply, state()} | {:stop, :lease_lost, state()}
   def handle_info(:heartbeat, %{config: config, instance: %WorkflowInstance{} = instance} = state) do
     case Claim.renew(config, instance) do
       {:ok, renewed} ->
@@ -76,6 +91,7 @@ defmodule Interruptus.Runner do
 
   # Handles {:retry, attempt} — schedules another execution after backoff.
   @doc false
+  @spec handle_info({:retry, non_neg_integer()}, state()) :: {:noreply, state()}
   def handle_info({:retry, attempt}, state) do
     send(self(), :run)
     {:noreply, put_in(state.instance.attempt_count, attempt)}
@@ -83,18 +99,21 @@ defmodule Interruptus.Runner do
 
   # Handles :stop — normal shutdown after completion or compensation.
   @doc false
+  @spec handle_info(:stop, state()) :: {:stop, :normal, state()}
   def handle_info(:stop, state) do
     {:stop, :normal, state}
   end
 
   # Handles linked process exits without stopping the runner.
   @doc false
+  @spec handle_info({:EXIT, pid(), term()}, state()) :: {:noreply, state()}
   def handle_info({:EXIT, _pid, _reason}, state) do
     {:noreply, state}
   end
 
   # GenServer terminate: releases lease and emits telemetry.
   @doc false
+  @spec terminate(term(), state()) :: :ok
   @impl true
   def terminate(_reason, %{config: config, instance: %WorkflowInstance{} = instance}) do
     :telemetry.execute(
@@ -110,6 +129,7 @@ defmodule Interruptus.Runner do
   @doc false
   def terminate(_reason, _state), do: :ok
 
+  @spec execute(state()) :: state()
   defp execute(%{config: config, workflow_module: workflow_module, workflow_id: workflow_id} = state) do
     with {:ok, instance} <- Claim.acquire(config, workflow_id),
          command <- build_command(workflow_module, instance) do
@@ -130,6 +150,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec run_loop(state(), workflow_command(), non_neg_integer()) :: state()
   defp run_loop(state, command, stage_index) do
     %{workflow_module: workflow_module} = state
     segments = workflow_module.flattened_pipelines()
@@ -159,6 +180,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec checkpoint_and_continue(state(), workflow_command(), non_neg_integer()) :: state()
   defp checkpoint_and_continue(state, command, next_index) do
     %{config: config, instance: instance} = state
 
@@ -188,6 +210,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec complete_workflow(state(), workflow_command()) :: state()
   defp complete_workflow(state, command) do
     %{config: config, instance: instance, workflow_module: workflow_module} = state
 
@@ -217,6 +240,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec suspend_workflow(state(), workflow_command(), term(), map(), non_neg_integer()) :: state()
   defp suspend_workflow(state, command, reason, metadata, index) do
     %{config: config, instance: instance} = state
 
@@ -247,18 +271,20 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec handle_failure(state(), workflow_command(), term()) :: state()
   defp handle_failure(state, command, reason) do
     %{config: config, workflow_module: workflow_module, instance: instance} = state
     policy = workflow_module.restart_policy()
     attempt = instance.attempt_count + 1
 
-    Store.log_attempt(config, %{
-      workflow_id: instance.id,
-      stage_name: stage_name(instance),
-      attempt_number: attempt,
-      outcome: outcome_for(reason),
-      error: %{reason: inspect(reason)}
-    })
+    _ =
+      Store.log_attempt(config, %{
+        workflow_id: instance.id,
+        stage_name: stage_name(instance),
+        attempt_number: attempt,
+        outcome: outcome_for(reason),
+        error: %{reason: inspect(reason)}
+      })
 
     if Restart.retry?(policy, attempt) and Restart.retryable?(policy, reason) do
       delay = Restart.backoff_ms(policy, attempt)
@@ -278,6 +304,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec rollback_or_fail(state(), workflow_command(), term()) :: state()
   defp rollback_or_fail(state, command, reason) do
     %{config: config, workflow_module: workflow_module, instance: instance} = state
     compensate_fns = workflow_module.rollback_policy().compensate
@@ -306,7 +333,7 @@ defmodule Interruptus.Runner do
           status: :failed,
           locked_by: nil,
           locked_until: nil,
-          errors: Map.put(instance.errors || %{}, "failure", inspect(reason))
+          errors: Map.put(instance.errors, "failure", inspect(reason))
         })
 
         :telemetry.execute(
@@ -320,6 +347,7 @@ defmodule Interruptus.Runner do
     end
   end
 
+  @spec build_command(module(), WorkflowInstance.t()) :: workflow_command()
   defp build_command(workflow_module, %WorkflowInstance{} = instance) do
     params =
       instance.params
@@ -327,10 +355,11 @@ defmodule Interruptus.Runner do
       |> Enum.map(fn {k, v} -> {k, v} end)
 
     workflow_module.new(params)
-    |> Map.put(:data, Map.merge(workflow_module.__struct__().data, atomize_keys(instance.data)))
-    |> Map.put(:errors, instance.errors || %{})
+    |> Map.put(:data, Map.merge(workflow_module.new([]).data, atomize_keys(instance.data)))
+    |> Map.put(:errors, instance.errors)
   end
 
+  @spec atomize_keys(map()) :: map()
   defp atomize_keys(map) when is_map(map) do
     Map.new(map, fn
       {k, v} when is_binary(k) ->
@@ -345,19 +374,24 @@ defmodule Interruptus.Runner do
     end)
   end
 
+  @spec schedule_heartbeat(Config.t()) :: reference()
   defp schedule_heartbeat(%Config{heartbeat_interval: interval}) do
     Process.send_after(self(), :heartbeat, interval)
   end
 
+  @spec stage_timeout(module()) :: :infinity
   defp stage_timeout(_workflow_module), do: :infinity
 
+  @spec stage_name(WorkflowInstance.t()) :: String.t()
   defp stage_name(%WorkflowInstance{current_stage_index: index}), do: "stage_#{index}"
 
+  @spec outcome_for(term()) :: attempt_outcome()
   defp outcome_for(:halted), do: :halted
   defp outcome_for(:timeout), do: :timeout
   defp outcome_for(:verify_failed), do: :verify_failed
   defp outcome_for(_), do: :failure
 
+  @spec stringify_keys(map()) :: map()
   defp stringify_keys(map) when is_map(map) do
     Map.new(map, fn
       {k, v} when is_atom(k) -> {Atom.to_string(k), v}

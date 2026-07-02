@@ -81,7 +81,7 @@ defmodule Interruptus.Store do
     * `{:ok, %WorkflowInstance{}}` - freshly loaded row after update
     * `{:error, :stale_lock}` - another process updated the row first
   """
-  @spec update_with_lock(Config.t(), WorkflowInstance.t(), map()) ::
+  @spec update_with_lock(Config.t(), WorkflowInstance.t() | WorkflowInstance.lock_ref(), map()) ::
           {:ok, WorkflowInstance.t()} | {:error, :stale_lock | Ecto.Changeset.t()}
   def update_with_lock(config, %WorkflowInstance{id: id, lock_version: version}, attrs) do
     now = DateTime.utc_now()
@@ -138,7 +138,7 @@ defmodule Interruptus.Store do
     * `{:ok, %StageAttempt{}}` - inserted attempt row
     * `{:error, %Ecto.Changeset{}}` - validation failure
   """
-  @spec log_attempt(Config.t(), map()) ::
+  @spec log_attempt(Config.t(), StageAttempt.attempt_attrs()) ::
           {:ok, StageAttempt.t()} | {:error, Ecto.Changeset.t()}
   def log_attempt(config, attrs) do
     %StageAttempt{}
@@ -175,12 +175,15 @@ defmodule Interruptus.Store do
     )
   end
 
+  @spec build_set_fields(map(), DateTime.t()) :: [{atom(), term()}]
   defp build_set_fields(attrs, now) do
     attrs
     |> Map.put(:updated_at, now)
     |> Enum.map(fn {k, v} -> {k, v} end)
   end
 
+  @spec insert_checkpoint(Config.t(), WorkflowInstance.t()) ::
+          {:ok, Checkpoint.t()} | {:error, Ecto.Changeset.t()}
   defp insert_checkpoint(config, %WorkflowInstance{} = instance) do
     %Checkpoint{}
     |> Checkpoint.changeset(%{
@@ -192,6 +195,7 @@ defmodule Interruptus.Store do
     |> then(&Repo.insert(config, &1))
   end
 
+  @spec get!(Config.t(), Ecto.UUID.t()) :: WorkflowInstance.t()
   defp get!(config, id) do
     Repo.one!(config, from(w in WorkflowInstance, where: w.id == ^id))
   end

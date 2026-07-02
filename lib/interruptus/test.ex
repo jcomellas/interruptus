@@ -46,6 +46,13 @@ defmodule Interruptus.Test do
     do_await_status(config, workflow_id, expected_status, deadline, interval)
   end
 
+  @spec do_await_status(
+          Config.t(),
+          Ecto.UUID.t(),
+          atom(),
+          integer(),
+          non_neg_integer()
+        ) :: {:ok, WorkflowInstance.t()} | {:error, :timeout}
   defp do_await_status(config, workflow_id, expected_status, deadline, interval) do
     case Store.get(config, workflow_id) do
       %WorkflowInstance{status: ^expected_status} = instance ->

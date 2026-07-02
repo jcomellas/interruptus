@@ -109,6 +109,7 @@ defmodule Interruptus.Config do
     config
   end
 
+  @spec validate!(t()) :: t()
   defp validate!(%__MODULE__{node_id: nil} = config) do
     node = Atom.to_string(Node.self())
     %{config | node_id: node}

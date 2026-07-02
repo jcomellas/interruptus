@@ -46,6 +46,7 @@ defmodule Interruptus.Schemas.Checkpoint do
 
   # Builds a changeset for checkpoint insert. Used by Interruptus.Store.
   @doc false
+  @spec changeset(Ecto.Schema.t(), map()) :: Ecto.Changeset.t()
   def changeset(checkpoint, attrs) do
     checkpoint
     |> cast(attrs, [:workflow_id, :stage_index, :params, :data, :inserted_at])
@@ -53,6 +54,7 @@ defmodule Interruptus.Schemas.Checkpoint do
     |> put_inserted_at()
   end
 
+  @spec put_inserted_at(Ecto.Changeset.t()) :: Ecto.Changeset.t()
   defp put_inserted_at(changeset) do
     case get_field(changeset, :inserted_at) do
       nil -> put_change(changeset, :inserted_at, DateTime.utc_now())

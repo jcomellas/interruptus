@@ -12,12 +12,14 @@ defmodule Interruptus.RunnerSupervisor do
 
   # Starts the DynamicSupervisor named Interruptus.RunnerSupervisor.
   @doc false
+  @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts \\ []) do
     DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   # DynamicSupervisor init callback. Uses :one_for_one strategy.
   @doc false
+  @spec init(keyword()) :: {:ok, map()}
   @impl true
   def init(_opts) do
     DynamicSupervisor.init(strategy: :one_for_one)

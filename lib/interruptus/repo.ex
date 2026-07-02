@@ -164,7 +164,7 @@ defmodule Interruptus.Repo do
 
     * `Postgrex.Error` or other DB errors - when SQL execution fails
   """
-  @spec query!(Config.t(), String.t(), list(), keyword()) :: Ecto.Adapters.SQL.Result.t()
+  @spec query!(Config.t(), String.t(), list(), keyword()) :: map()
   def query!(config, sql, params \\ [], opts \\ []) do
     config.repo.query!(sql, params, repo_opts(config, opts))
   end

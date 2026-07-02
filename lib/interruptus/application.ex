@@ -17,6 +17,7 @@ defmodule Interruptus.Application do
 
   # Application start callback. Starts Interruptus.Supervisor with :one_for_one strategy.
   @doc false
+  @spec start(Application.start_type(), [term()]) :: Supervisor.on_start()
   @impl true
   def start(_type, _args) do
     children = [

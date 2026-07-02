@@ -12,14 +12,18 @@ defmodule Interruptus.Recovery do
   alias Interruptus.Config
   alias Interruptus.Store
 
+  @typep state :: %{config: Config.t()}
+
   # Starts the Recovery GenServer named Interruptus.Recovery.
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   # GenServer init callback. Schedules the first recovery scan.
   @doc false
+  @spec init(keyword()) :: {:ok, state()}
   @impl true
   def init(opts) do
     config = Keyword.get(opts, :config, Config.fetch())
@@ -29,6 +33,7 @@ defmodule Interruptus.Recovery do
 
   # Handles :recover — runs recover_all/1 and reschedules the next scan.
   @doc false
+  @spec handle_info(:recover, state()) :: {:noreply, state()}
   @impl true
   def handle_info(:recover, %{config: config} = state) do
     recover_all(config)
@@ -63,10 +68,12 @@ defmodule Interruptus.Recovery do
     :ok
   end
 
+  @spec schedule_recovery(pos_integer()) :: reference()
   defp schedule_recovery(interval) do
     Process.send_after(self(), :recover, interval)
   end
 
+  @spec module_from_type(String.t()) :: module()
   defp module_from_type(type) when is_binary(type) do
     type
     |> String.split(".")

@@ -243,6 +243,7 @@ defmodule Interruptus.Command do
     apply(m, f, [command, params, data] ++ a)
   end
 
+  @spec get_param(map(), atom(), any()) :: any()
   defp get_param(params, key, default) do
     case Map.get(params, key) do
       nil -> Map.get(params, to_string(key), default)

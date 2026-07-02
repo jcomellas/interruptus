@@ -14,6 +14,13 @@ defmodule Interruptus.Policy.Restart do
   Configure via the `restart_policy/1` macro in `Interruptus.Workflow`.
   """
 
+  @type t :: %{
+          max_attempts: pos_integer(),
+          backoff: :constant | :exponential,
+          base_interval: pos_integer(),
+          retryable_errors: :all | [term()]
+        }
+
   @doc """
   Returns whether another attempt should be made.
 
@@ -35,7 +42,7 @@ defmodule Interruptus.Policy.Restart do
       iex> Interruptus.Policy.Restart.retry?(policy, 3)
       false
   """
-  @spec retry?(map(), non_neg_integer()) :: boolean()
+  @spec retry?(t(), non_neg_integer()) :: boolean()
   def retry?(policy, attempt_count) do
     attempt_count < policy.max_attempts
   end
@@ -65,7 +72,7 @@ defmodule Interruptus.Policy.Restart do
       iex> Interruptus.Policy.Restart.backoff_ms(policy, 2)
       2000
   """
-  @spec backoff_ms(map(), pos_integer()) :: non_neg_integer()
+  @spec backoff_ms(t(), pos_integer()) :: non_neg_integer()
   def backoff_ms(%{backoff: :constant, base_interval: base}, _attempt), do: base
 
   def backoff_ms(%{backoff: :exponential, base_interval: base}, attempt) do
@@ -100,7 +107,7 @@ defmodule Interruptus.Policy.Restart do
       iex> Interruptus.Policy.Restart.retryable?(policy, :halted)
       false
   """
-  @spec retryable?(map(), term()) :: boolean()
+  @spec retryable?(t(), term()) :: boolean()
   def retryable?(%{retryable_errors: :all}, _reason), do: true
 
   def retryable?(%{retryable_errors: errors}, reason) when is_list(errors) do

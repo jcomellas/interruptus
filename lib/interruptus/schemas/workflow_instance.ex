@@ -32,10 +32,20 @@ defmodule Interruptus.Schemas.WorkflowInstance do
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
+  @type status ::
+          :pending
+          | :running
+          | :suspended
+          | :completed
+          | :failed
+          | :compensating
+          | :compensated
+          | :cancelled
+
   @type t :: %__MODULE__{
           id: Ecto.UUID.t(),
           workflow_type: String.t(),
-          status: atom(),
+          status: status(),
           params: map(),
           data: map(),
           current_stage_index: integer(),
@@ -50,6 +60,11 @@ defmodule Interruptus.Schemas.WorkflowInstance do
           errors: map(),
           inserted_at: DateTime.t(),
           updated_at: DateTime.t()
+        }
+
+  @type lock_ref :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          lock_version: non_neg_integer()
         }
 
   @statuses ~w(
@@ -81,6 +96,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
 
   # Builds a changeset for insert and update. Used internally by Interruptus.Store.
   @doc false
+  @spec changeset(Ecto.Schema.t(), map()) :: Ecto.Changeset.t()
   def changeset(instance, attrs) do
     instance
     |> cast(attrs, [
@@ -169,6 +185,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
     status in [:pending, :suspended, :running] and lease_expired?(locked_until, now)
   end
 
+  @spec lease_expired?(DateTime.t() | nil, DateTime.t()) :: boolean()
   defp lease_expired?(nil, _now), do: true
 
   defp lease_expired?(locked_until, now) do

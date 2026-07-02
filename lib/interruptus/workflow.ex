@@ -68,6 +68,10 @@ defmodule Interruptus.Workflow do
 
   @type segment :: Interruptus.Workflow.Segment.t()
 
+  @type raw_segment ::
+          {:stage, atom()}
+          | {:checkpoint, %{verify: atom() | nil, pipelines: [atom()]}}
+
   @doc """
   Imports workflow definition macros into the calling module.
 
@@ -309,6 +313,7 @@ defmodule Interruptus.Workflow do
 
       Implements `Interruptus.Workflow.Behaviour`.
       """
+      @spec workflow_type() :: module()
       @impl Interruptus.Workflow.Behaviour
       def workflow_type, do: __MODULE__
 
@@ -317,6 +322,7 @@ defmodule Interruptus.Workflow do
 
       Each entry is `{:stage, name}` or `{:checkpoint, %{verify: ..., pipelines: ...}}`.
       """
+      @spec segments() :: [Interruptus.Workflow.raw_segment()]
       @impl Interruptus.Workflow.Behaviour
       def segments, do: unquote(Macro.escape(segments))
 
@@ -326,6 +332,7 @@ defmodule Interruptus.Workflow do
       Stages become `%{type: :stage, ...}` maps; checkpoints become
       `%{type: :checkpoint, verify: ..., pipelines: ...}`.
       """
+      @spec flattened_pipelines() :: [Interruptus.Workflow.segment()]
       @impl Interruptus.Workflow.Behaviour
       def flattened_pipelines, do: unquote(Macro.escape(flattened))
 
@@ -334,18 +341,21 @@ defmodule Interruptus.Workflow do
 
       See `Interruptus.Policy.Restart` for map shape.
       """
+      @spec restart_policy() :: Interruptus.Policy.Restart.t()
       @impl Interruptus.Workflow.Behaviour
       def restart_policy, do: unquote(Macro.escape(normalize_restart_policy(restart_policy)))
 
       @doc """
       Returns the normalized rollback policy map with a `:compensate` function list.
       """
+      @spec rollback_policy() :: Interruptus.Policy.Rollback.t()
       @impl Interruptus.Workflow.Behaviour
       def rollback_policy, do: unquote(Macro.escape(normalize_rollback_policy(rollback_policy)))
 
       @doc """
       Returns the pipeline version integer stored on new instances.
       """
+      @spec pipeline_version() :: pos_integer()
       @impl Interruptus.Workflow.Behaviour
       def pipeline_version, do: unquote(pipeline_version)
 
@@ -384,7 +394,10 @@ defmodule Interruptus.Workflow do
         * `{:suspend, reason, metadata, command}` tuple
         * `{:error, term()}` on failure
       """
-      @spec run(map() | Keyword.t() | t()) :: t()
+      @spec run(map() | Keyword.t() | t()) ::
+              t()
+              | {:suspend, term(), map(), t()}
+              | {:error, term()}
       def run(%__MODULE__{pipelines: pipelines} = command) do
         pipelines
         |> Enum.reduce_while(command, fn segment, acc ->
@@ -411,6 +424,7 @@ defmodule Interruptus.Workflow do
 
   # Compile-time helper for param/2. Raises ArgumentError on duplicate names.
   @doc false
+  @spec __param__(module(), atom(), keyword()) :: :ok
   def __param__(mod, name, opts) do
     params = Module.get_attribute(mod, :workflow_params, [])
 
@@ -424,6 +438,7 @@ defmodule Interruptus.Workflow do
 
   # Compile-time helper for data/1. Raises ArgumentError on duplicate names.
   @doc false
+  @spec __data__(module(), atom()) :: :ok
   def __data__(mod, name) do
     data = Module.get_attribute(mod, :workflow_data, [])
 
@@ -436,6 +451,7 @@ defmodule Interruptus.Workflow do
 
   # Compile-time helper for pipeline/1.
   @doc false
+  @spec __pipeline__(module(), atom()) :: :ok
   def __pipeline__(mod, name) do
     segment = Module.get_attribute(mod, :workflow_current_segment)
 
@@ -449,11 +465,13 @@ defmodule Interruptus.Workflow do
 
   # Compile-time helper for checkpoint/1. Finalizes the current checkpoint segment.
   @doc false
+  @spec __checkpoint_segment__(module(), map()) :: :ok
   def __checkpoint_segment__(mod, segment) do
     segment = %{segment | pipelines: Enum.reverse(segment.pipelines)}
     Module.put_attribute(mod, :workflow_segments, {:checkpoint, segment})
   end
 
+  @spec flatten_segments([raw_segment()]) :: [segment()]
   defp flatten_segments(segments) do
     Enum.flat_map(segments, fn
       {:stage, name} ->
@@ -464,6 +482,7 @@ defmodule Interruptus.Workflow do
     end)
   end
 
+  @spec normalize_restart_policy(keyword() | []) :: Interruptus.Policy.Restart.t()
   defp normalize_restart_policy([]),
     do: %{max_attempts: 3, backoff: :exponential, base_interval: 1_000, retryable_errors: :all}
 
@@ -476,6 +495,7 @@ defmodule Interruptus.Workflow do
     }
   end
 
+  @spec normalize_rollback_policy(keyword() | []) :: Interruptus.Policy.Rollback.t()
   defp normalize_rollback_policy([]), do: %{compensate: []}
 
   defp normalize_rollback_policy(opts) do
@@ -518,10 +538,10 @@ defmodule Interruptus.Workflow.Behaviour do
   """
 
   @callback workflow_type() :: module()
-  @callback segments() :: [Interruptus.Workflow.segment()]
+  @callback segments() :: [Interruptus.Workflow.raw_segment()]
   @callback flattened_pipelines() :: [Interruptus.Workflow.segment()]
-  @callback restart_policy() :: map()
-  @callback rollback_policy() :: map()
+  @callback restart_policy() :: Interruptus.Policy.Restart.t()
+  @callback rollback_policy() :: Interruptus.Policy.Rollback.t()
   @callback pipeline_version() :: pos_integer()
 end
 
