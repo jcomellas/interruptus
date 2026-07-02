@@ -4,19 +4,19 @@ defmodule Interruptus.Test.Support.Workflows.Simple do
   use Interruptus.Workflow
 
   workflow do
-    param(:value, :integer)
+    param :value, :integer
 
-    data(:result, :integer)
+    data :result, :integer
 
-    pipeline(:double)
+    pipeline :double
 
     checkpoint do
-      verify(:verify_doubled)
-      pipeline(:save_result)
+      verify :verify_doubled
+      pipeline :save_result
     end
 
-    restart_policy(max_attempts: 2, backoff: :constant, base_interval: 10)
-    rollback_policy(compensate: [:undo])
+    restart_policy max_attempts: 2, backoff: :constant, base_interval: 10
+    rollback_policy compensate: [:undo]
   end
 
   def double(command, %{value: value}, _data) do

@@ -4,11 +4,11 @@ defmodule Interruptus.Test.Support.Workflows.TypedFields do
   use Interruptus.Workflow
 
   workflow do
-    param(:required_int, :integer)
-    param(:optional_int, :integer, default: 10)
-    param(:amount, :decimal)
+    param :required_int, :integer
+    param :optional_int, :integer, default: 10
+    param :amount, :decimal
 
-    data(:name, :string)
-    data(:count, :integer)
+    data :name, :string
+    data :count, :integer
   end
 end

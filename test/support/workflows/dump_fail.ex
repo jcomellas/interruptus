@@ -6,11 +6,11 @@ defmodule Interruptus.Test.Support.Workflows.DumpFail do
   alias Interruptus.Command
 
   workflow do
-    param(:value, :integer)
-    data(:label, :string)
+    param :value, :integer
+    data :label, :string
 
     checkpoint do
-      pipeline(:set_bad_data)
+      pipeline :set_bad_data
     end
   end
 
