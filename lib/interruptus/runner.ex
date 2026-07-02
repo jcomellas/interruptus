@@ -110,9 +110,7 @@ defmodule Interruptus.Runner do
   @doc false
   def terminate(_reason, _state), do: :ok
 
-  defp execute(
-         %{config: config, workflow_module: workflow_module, workflow_id: workflow_id} = state
-       ) do
+  defp execute(%{config: config, workflow_module: workflow_module, workflow_id: workflow_id} = state) do
     with {:ok, instance} <- Claim.acquire(config, workflow_id),
          command <- build_command(workflow_module, instance) do
       schedule_heartbeat(config)
@@ -141,9 +139,7 @@ defmodule Interruptus.Runner do
     else
       segment = Enum.at(segments, stage_index)
 
-      case Engine.run_segment(workflow_module, segment, command,
-             timeout: stage_timeout(workflow_module)
-           ) do
+      case Engine.run_segment(workflow_module, segment, command, timeout: stage_timeout(workflow_module)) do
         {:ok, updated} ->
           if segment.type == :checkpoint do
             checkpoint_and_continue(state, updated, stage_index + 1)

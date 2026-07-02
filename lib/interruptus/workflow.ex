@@ -270,6 +270,8 @@ defmodule Interruptus.Workflow do
     end
   end
 
+  # Macro expansion emits the full workflow module; high complexity is expected here.
+  # credo:disable-for-lines:136 Credo.Check.Refactor.CyclomaticComplexity
   defmacro __before_compile__(env) do
     segments = env.module |> Module.get_attribute(:workflow_segments) |> Enum.reverse()
     params = env.module |> Module.get_attribute(:workflow_params) |> Enum.reverse()

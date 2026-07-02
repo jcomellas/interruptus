@@ -49,8 +49,7 @@ defmodule Interruptus.RunnerSupervisor do
 
       [] ->
         spec =
-          {Interruptus.Runner,
-           config: config, workflow_module: workflow_module, workflow_id: workflow_id}
+          {Interruptus.Runner, config: config, workflow_module: workflow_module, workflow_id: workflow_id}
 
         DynamicSupervisor.start_child(__MODULE__, spec)
     end
