@@ -81,6 +81,44 @@ defmodule Interruptus.RunnerInterruptionTest do
     assert Store.get(config, instance.id).current_stage_index == 2
   end
 
+  test "stale runner stops with lease_lost after cross-node acquire", %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(BarrierWorkflow, %{token: "lease-lost"}, config: config.name)
+
+    :ok = Test.await_barrier_held(:before_checkpoint)
+
+    stale_pid = Test.runner_pid(instance.id)
+    ref = Process.monitor(stale_pid)
+
+    pre_steal = Store.get(config, instance.id)
+    config_b = Test.with_node_id(config, "lease-lost-node-b")
+
+    :ok = Test.expire_lease(config, instance.id)
+    assert {:ok, _claimed_b} = Claim.acquire(config_b, instance.id)
+
+    stolen = Store.get(config, instance.id)
+    assert stolen.locked_by == config_b.node_id
+    assert stolen.lock_version == pre_steal.lock_version + 1
+
+    :ok = Barrier.release(:before_checkpoint)
+
+    assert_receive {:DOWN, ^ref, :process, ^stale_pid, :lease_lost}, 5_000
+    refute Process.alive?(stale_pid)
+
+    case Test.runner_pid(instance.id) do
+      nil ->
+        :ok
+
+      ^stale_pid ->
+        refute Process.alive?(stale_pid)
+
+      other_pid ->
+        flunk("unexpected replacement runner #{inspect(other_pid)}")
+    end
+
+    assert Store.get(config, instance.id).locked_by == config_b.node_id
+  end
+
   test "multi-checkpoint workflow resumes from correct index after crash", %{config: config} do
     assert {:ok, instance} =
              Interruptus.start(MultiCheckpoint, %{value: 1}, config: config.name)

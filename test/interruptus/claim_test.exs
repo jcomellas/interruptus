@@ -117,6 +117,65 @@ defmodule Interruptus.ClaimTest do
     assert released.locked_until == nil
   end
 
+  test "lock_version increments only on acquire and never decreases", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :pending,
+        params: %{},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1
+      })
+
+    assert Store.get(config, instance.id).lock_version == 0
+
+    assert {:ok, claimed} = Claim.acquire(config, instance.id)
+    assert claimed.lock_version == 1
+    assert Store.get(config, instance.id).lock_version == 1
+
+    assert {:ok, renewed} = Claim.renew(config, claimed)
+    assert renewed.lock_version == 1
+    assert Store.get(config, instance.id).lock_version == 1
+
+    assert {:ok, released} = Claim.release(config, renewed)
+    assert released.lock_version == 1
+    assert Store.get(config, instance.id).lock_version == 1
+
+    assert {:ok, reclaimed} = Claim.acquire(config, instance.id)
+    assert reclaimed.lock_version == 2
+    assert Store.get(config, instance.id).lock_version == 2
+  end
+
+  test "re-acquire by another node bumps lock_version and fences stale renew", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :pending,
+        params: %{},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1
+      })
+
+    config_a = config
+    config_b = Test.with_node_id(config, "fencing-node-b")
+
+    assert {:ok, claimed_a} = Claim.acquire(config_a, instance.id)
+    assert claimed_a.lock_version == 1
+    stale_a = claimed_a
+
+    :ok = Test.expire_lease(config_a, instance.id)
+    assert {:ok, claimed_b} = Claim.acquire(config_b, instance.id)
+    assert claimed_b.lock_version == 2
+
+    assert {:error, :stale_lock} = Claim.renew(config_a, stale_a)
+
+    row = Store.get(config, instance.id)
+    assert row.lock_version == 2
+    assert row.locked_by == config_b.node_id
+  end
+
   test "parallel acquire has exactly one winner", %{config: config} do
     {:ok, instance} =
       Store.insert_workflow(config, %{
