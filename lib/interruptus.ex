@@ -15,7 +15,8 @@ defmodule Interruptus do
         {Interruptus, repo: MyApp.Repo}
       ]
 
-  Run `Interruptus.Migration.up/0` from your Ecto migrations, then define workflows
+  Run `Interruptus.Migration.up/0` from your Ecto migrations (pass the same
+  `:prefix` as your config when using a non-public schema), then define workflows
   with `Interruptus.Workflow` and start them via `start/3`.
 
   ## Lifecycle

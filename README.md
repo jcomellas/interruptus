@@ -38,6 +38,14 @@ defmodule MyApp.Repo.Migrations.AddInterruptus do
   def up, do: Interruptus.Migration.up()
   def down, do: Interruptus.Migration.down()
 end
+
+# optional: isolate tables in a dedicated schema (match config :prefix)
+defmodule MyApp.Repo.Migrations.AddPrefixedInterruptus do
+  use Ecto.Migration
+
+  def up, do: Interruptus.Migration.up(prefix: "private")
+  def down, do: Interruptus.Migration.down(prefix: "private")
+end
 ```
 
 ```elixir

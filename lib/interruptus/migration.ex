@@ -12,7 +12,15 @@ defmodule Interruptus.Migration do
         def up, do: Interruptus.Migration.up()
         def down, do: Interruptus.Migration.down()
       end
+
+  Use the same `:prefix` as `Interruptus.Config` when isolating tables in a
+  non-public schema:
+
+      def up, do: Interruptus.Migration.up(prefix: "private")
+      def down, do: Interruptus.Migration.down(prefix: "private")
   """
+
+  use Ecto.Migration
 
   @current_version 1
 
@@ -24,6 +32,7 @@ defmodule Interruptus.Migration do
   ## Options
 
     * `:version` - target version (default current library version)
+    * `:prefix` - PostgreSQL schema prefix (default public schema)
 
   ## Returns
 
@@ -32,11 +41,11 @@ defmodule Interruptus.Migration do
   @spec up(keyword()) :: :ok
   def up(opts \\ []) do
     version = Keyword.get(opts, :version, @current_version)
-    migrated = migrated_version()
+    migrated = migrated_version(opts)
 
     if migrated < version do
       for v <- (migrated + 1)..version do
-        apply(__MODULE__, :"up#{v}", [])
+        apply(__MODULE__, :"up#{v}", [opts])
       end
     end
 
@@ -49,6 +58,7 @@ defmodule Interruptus.Migration do
   ## Options
 
     * `:version` - target version to roll back to (default `0`, drops all tables)
+    * `:prefix` - PostgreSQL schema prefix (default public schema)
 
   ## Returns
 
@@ -57,109 +67,134 @@ defmodule Interruptus.Migration do
   @spec down(keyword()) :: :ok
   def down(opts \\ []) do
     version = Keyword.get(opts, :version, 0)
-    migrated = migrated_version()
+    migrated = migrated_version(opts)
 
     if migrated > version do
       for v <- migrated..(version + 1)//-1 do
-        apply(__MODULE__, :"down#{v}", [])
+        apply(__MODULE__, :"down#{v}", [opts])
       end
     end
 
     :ok
   end
 
-  defp migrated_version do
-    if table_exists?("interruptus_workflows"), do: @current_version, else: 0
+  defp migrated_version(opts) do
+    prefix = Keyword.get(opts, :prefix)
+
+    if table_exists?("interruptus_workflows", prefix) do
+      @current_version
+    else
+      0
+    end
   end
 
-  defp table_exists?(table) do
-    query = "SELECT to_regclass($1)"
-    {:ok, %{rows: [[result]]}} = repo().query(query, [table])
-    not is_nil(result)
+  defp table_exists?(table, prefix) do
+    Ecto.Adapters.SQL.table_exists?(repo(), table, prefix: prefix)
   rescue
     _ -> false
   end
 
-  defp repo, do: Ecto.Migration.repo()
-
   # Version 1 migration: creates Interruptus tables and indexes.
   @doc false
-  def up1 do
-    repo().query!("""
-    CREATE TABLE IF NOT EXISTS interruptus_workflows (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      workflow_type VARCHAR(255) NOT NULL,
-      status VARCHAR(50) NOT NULL DEFAULT 'pending',
-      params JSONB NOT NULL DEFAULT '{}',
-      data JSONB NOT NULL DEFAULT '{}',
-      current_stage_index INTEGER NOT NULL DEFAULT 0,
-      pipeline_version INTEGER NOT NULL DEFAULT 1,
-      idempotency_key VARCHAR(255),
-      locked_by VARCHAR(255),
-      locked_until TIMESTAMPTZ,
-      lock_version INTEGER NOT NULL DEFAULT 0,
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      suspend_reason VARCHAR(255),
-      suspend_metadata JSONB,
-      errors JSONB NOT NULL DEFAULT '{}',
-      inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  def up1(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    table_opts = [primary_key: false, prefix: prefix]
+
+    create_if_not_exists table(:interruptus_workflows, table_opts) do
+      add :id, :binary_id, primary_key: true
+      add :workflow_type, :string, null: false
+      add :status, :string, null: false, default: "pending"
+      add :params, :map, null: false, default: "{}"
+      add :data, :map, null: false, default: "{}"
+      add :current_stage_index, :integer, null: false, default: 0
+      add :pipeline_version, :integer, null: false, default: 1
+      add :idempotency_key, :string
+      add :locked_by, :string
+      add :locked_until, :utc_datetime_usec
+      add :lock_version, :integer, null: false, default: 0
+      add :attempt_count, :integer, null: false, default: 0
+      add :suspend_reason, :string
+      add :suspend_metadata, :map
+      add :errors, :map, null: false, default: "{}"
+      timestamps(type: :utc_datetime_usec)
+    end
+
+    create_if_not_exists(
+      unique_index(:interruptus_workflows, [:workflow_type, :idempotency_key],
+        name: :interruptus_workflows_idempotency_idx,
+        where: "idempotency_key IS NOT NULL",
+        prefix: prefix
+      )
     )
-    """)
 
-    repo().query!("""
-    CREATE UNIQUE INDEX IF NOT EXISTS interruptus_workflows_idempotency_idx
-    ON interruptus_workflows (workflow_type, idempotency_key)
-    WHERE idempotency_key IS NOT NULL
-    """)
-
-    repo().query!("""
-    CREATE INDEX IF NOT EXISTS interruptus_workflows_status_locked_idx
-    ON interruptus_workflows (status, locked_until)
-    """)
-
-    repo().query!("""
-    CREATE TABLE IF NOT EXISTS interruptus_checkpoints (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      workflow_id UUID NOT NULL REFERENCES interruptus_workflows(id) ON DELETE CASCADE,
-      stage_index INTEGER NOT NULL,
-      params JSONB NOT NULL DEFAULT '{}',
-      data JSONB NOT NULL DEFAULT '{}',
-      inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    create_if_not_exists(
+      index(:interruptus_workflows, [:status, :locked_until],
+        name: :interruptus_workflows_status_locked_idx,
+        prefix: prefix
+      )
     )
-    """)
 
-    repo().query!("""
-    CREATE INDEX IF NOT EXISTS interruptus_checkpoints_workflow_idx
-    ON interruptus_checkpoints (workflow_id, stage_index)
-    """)
+    create_if_not_exists table(:interruptus_checkpoints, table_opts) do
+      add :id, :binary_id, primary_key: true
 
-    repo().query!("""
-    CREATE TABLE IF NOT EXISTS interruptus_stage_attempts (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      workflow_id UUID NOT NULL REFERENCES interruptus_workflows(id) ON DELETE CASCADE,
-      stage_name VARCHAR(255) NOT NULL,
-      attempt_number INTEGER NOT NULL DEFAULT 1,
-      outcome VARCHAR(50) NOT NULL,
-      error JSONB,
-      inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      add :workflow_id,
+          references(:interruptus_workflows,
+            type: :binary_id,
+            on_delete: :delete_all,
+            prefix: prefix
+          ),
+          null: false
+
+      add :stage_index, :integer, null: false
+      add :params, :map, null: false, default: "{}"
+      add :data, :map, null: false, default: "{}"
+      add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    end
+
+    create_if_not_exists(
+      index(:interruptus_checkpoints, [:workflow_id, :stage_index],
+        name: :interruptus_checkpoints_workflow_idx,
+        prefix: prefix
+      )
     )
-    """)
 
-    repo().query!("""
-    CREATE INDEX IF NOT EXISTS interruptus_stage_attempts_workflow_idx
-    ON interruptus_stage_attempts (workflow_id)
-    """)
+    create_if_not_exists table(:interruptus_stage_attempts, table_opts) do
+      add :id, :binary_id, primary_key: true
+
+      add :workflow_id,
+          references(:interruptus_workflows,
+            type: :binary_id,
+            on_delete: :delete_all,
+            prefix: prefix
+          ),
+          null: false
+
+      add :stage_name, :string, null: false
+      add :attempt_number, :integer, null: false, default: 1
+      add :outcome, :string, null: false
+      add :error, :map
+      add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    end
+
+    create_if_not_exists(
+      index(:interruptus_stage_attempts, [:workflow_id],
+        name: :interruptus_stage_attempts_workflow_idx,
+        prefix: prefix
+      )
+    )
 
     :ok
   end
 
   # Version 1 rollback: drops all Interruptus tables.
   @doc false
-  def down1 do
-    repo().query!("DROP TABLE IF EXISTS interruptus_stage_attempts")
-    repo().query!("DROP TABLE IF EXISTS interruptus_checkpoints")
-    repo().query!("DROP TABLE IF EXISTS interruptus_workflows")
+  def down1(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    drop_if_exists table(:interruptus_stage_attempts, prefix: prefix)
+    drop_if_exists table(:interruptus_checkpoints, prefix: prefix)
+    drop_if_exists table(:interruptus_workflows, prefix: prefix)
+
     :ok
   end
 end
