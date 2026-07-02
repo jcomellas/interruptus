@@ -46,6 +46,24 @@ defmodule Interruptus.Runner do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  # Runners are :temporary — a crashed runner is NOT auto-restarted by the
+  # DynamicSupervisor. Recovery of a crashed instance happens through lease
+  # expiry + Interruptus.Recovery, which re-claims and starts a fresh runner
+  # with reloaded state. Permanent/transient restarts would (a) resurrect a
+  # runner with stale in-memory state and (b) let a crash-looping runner trip
+  # the supervisor restart intensity, cascading up and taking down the shared
+  # Interruptus.Registry.
+  @doc false
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :temporary,
+      type: :worker
+    }
+  end
+
   # GenServer init: registers in Registry, trap_exit, schedules :run.
   @doc false
   @spec init(keyword()) :: {:ok, state()}

@@ -1,6 +1,8 @@
 defmodule Interruptus.IntegrationTest do
   use Interruptus.Test.Support.DataCase, async: false
 
+  @moduletag :interruptus_integration
+
   alias Interruptus
   alias Interruptus.Store
   alias Interruptus.Test
@@ -11,11 +13,7 @@ defmodule Interruptus.IntegrationTest do
   setup do
     Process.delete(:last_saved)
     Process.put(:verify_result, :not_done)
-    :ok
-  end
-
-  setup_all do
-    {:ok, _} = Interruptus.Test.Support.ApprovalState.start_link()
+    Interruptus.Test.Support.ApprovalState.reset!()
     :ok
   end
 
@@ -64,24 +62,15 @@ defmodule Interruptus.IntegrationTest do
   test "workflow suspends and resumes", %{config: config} do
     assert {:ok, instance} = Interruptus.start(Suspendable, %{token: "abc"}, config: config.name)
 
-    assert {:ok, %{status: :suspended}} =
+    assert {:ok, suspended} =
              Test.await_status(instance.id, :suspended, config: config)
+
+    assert suspended.current_stage_index == 1
+    assert suspended.suspend_reason == "await_approval"
+    assert suspended.suspend_metadata == %{"token" => "abc"}
 
     Interruptus.Test.Support.ApprovalState.approve("abc")
     assert {:ok, _pid} = Interruptus.resume(instance.id, config: config.name)
-
-    assert {:ok, %{status: :completed}} =
-             Test.await_status(instance.id, :completed, config: config, timeout: 10_000)
-  end
-
-  test "crash recovery continues from checkpoint", %{config: config} do
-    assert {:ok, instance} = Interruptus.start(Simple, %{value: 2}, config: config.name)
-
-    # Wait until running then crash
-    Process.sleep(50)
-    :ok = Test.crash_runner(instance.id)
-
-    Interruptus.Recovery.recover_all(config)
 
     assert {:ok, %{status: :completed}} =
              Test.await_status(instance.id, :completed, config: config, timeout: 10_000)

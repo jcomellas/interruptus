@@ -23,9 +23,18 @@ defmodule Interruptus.Application do
     children = [
       {Registry, keys: :unique, name: Interruptus.Registry},
       Interruptus.RunnerSupervisor,
-      Interruptus.Recovery
+      {Interruptus.Recovery, recovery_opts()}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Interruptus.Supervisor)
+  end
+
+  @spec recovery_opts() :: keyword()
+  defp recovery_opts do
+    if Application.get_env(:interruptus, :recovery_schedule, true) do
+      []
+    else
+      [schedule: false]
+    end
   end
 end

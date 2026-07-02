@@ -301,6 +301,7 @@ defmodule Interruptus.Workflow do
 
     flattened = flatten_segments(segments)
 
+    # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
       unquote(params_embed)
       unquote(data_embed)
@@ -391,10 +392,7 @@ defmodule Interruptus.Workflow do
       """
       @spec cast_params!(map() | Keyword.t()) :: map()
       def cast_params!(input) do
-        case cast_params(input) do
-          {:ok, params} -> params
-          {:error, changeset} -> raise Ecto.CastError, changeset: changeset
-        end
+        unquote(do_cast_params!(params))
       end
 
       @doc """
@@ -589,6 +587,18 @@ defmodule Interruptus.Workflow do
   defp cast_params_body(_params, required) do
     quote do
       Interruptus.Workflow.Fields.cast_params(__MODULE__.Params, unquote(required), input)
+    end
+  end
+
+  @spec do_cast_params!([{atom(), term(), keyword()}]) :: Macro.t()
+  defp do_cast_params!([]), do: quote(do: %{})
+
+  defp do_cast_params!(_params) do
+    quote do
+      case cast_params(input) do
+        {:ok, params} -> params
+        {:error, changeset} -> raise Ecto.CastError, changeset: changeset
+      end
     end
   end
 

@@ -2,6 +2,8 @@ import Config
 
 config :interruptus, ecto_repos: [Interruptus.Test.Repo]
 
+config :interruptus, recovery_schedule: false
+
 config :interruptus, Interruptus,
   repo: Interruptus.Test.Repo,
   prefix: "public",

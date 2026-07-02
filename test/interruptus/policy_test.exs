@@ -6,11 +6,6 @@ defmodule Interruptus.PolicyTest do
   alias Interruptus.Test.Support.CompensateOrder
   alias Interruptus.Test.Support.CompensateWorkflow
 
-  setup_all do
-    {:ok, _} = CompensateOrder.start_link()
-    :ok
-  end
-
   setup do
     CompensateOrder.reset!()
     :ok

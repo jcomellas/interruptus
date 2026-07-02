@@ -27,8 +27,17 @@ defmodule Interruptus.Recovery do
   @impl true
   def init(opts) do
     config = Keyword.get(opts, :config, Config.fetch())
-    schedule_recovery(config.recovery_interval)
+
+    if Keyword.get(opts, :schedule, recovery_schedule_enabled?()) do
+      schedule_recovery(config.recovery_interval)
+    end
+
     {:ok, %{config: config}}
+  end
+
+  @spec recovery_schedule_enabled?() :: boolean()
+  defp recovery_schedule_enabled? do
+    Application.get_env(:interruptus, :recovery_schedule, true)
   end
 
   # Handles :recover — runs recover_all/1 and reschedules the next scan.

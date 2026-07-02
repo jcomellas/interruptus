@@ -42,13 +42,31 @@ defmodule Interruptus.MixProject do
     ]
   end
 
+  # Test.Repo is only configured in config/test.exs; aliases that touch the
+  # database or run ExUnit must use :test even when invoked from another alias
+  # (e.g. mix precommit in the default :dev environment).
+  # defp preferred_cli_env do
+  def cli do
+    [
+      preferred_envs: [
+        precommit: :test,
+        test: :test,
+        "test.setup": :test,
+        setup: :test,
+        "ecto.setup": :test,
+        "ecto.reset": :test
+      ]
+    ]
+  end
+
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       "test.setup": ["ecto.create --quiet", "ecto.migrate --quiet"],
-      test: ["test.setup", "test"]
+      test: ["test.setup", "test"],
+      precommit: ["compile --warnings-as-errors", "deps.unlock --check-unused", "format", "test"]
     ]
   end
 

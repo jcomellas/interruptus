@@ -15,8 +15,15 @@ defmodule Interruptus.Test.Support.DataCase do
   end
 
   setup tags do
+    :ok = Interruptus.Test.Support.Runtime.start!()
+
     pid = Ecto.Adapters.SQL.Sandbox.start_owner!(Interruptus.Test.Repo, shared: not tags[:async])
+
     on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(pid) end)
+
+    unless tags[:async] do
+      on_exit(fn -> Interruptus.Test.Support.Runtime.cleanup!() end)
+    end
 
     unless tags[:async] do
       Ecto.Adapters.SQL.Sandbox.mode(Interruptus.Test.Repo, {:shared, pid})

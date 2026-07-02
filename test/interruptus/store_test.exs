@@ -1,6 +1,8 @@
 defmodule Interruptus.StoreTest do
   use Interruptus.Test.Support.DataCase, async: false
 
+  @moduletag :interruptus_integration
+
   alias Interruptus.Schemas.WorkflowInstance
   alias Interruptus.Store
 
@@ -37,5 +39,80 @@ defmodule Interruptus.StoreTest do
              })
 
     assert {:error, :stale_lock} = Store.update_with_lock(config, instance, %{status: :failed})
+  end
+
+  test "list_reclaimable includes non-terminal workflows with expired lease", %{config: config} do
+    past = DateTime.add(DateTime.utc_now(), -60, :second)
+    now = DateTime.utc_now()
+
+    for status <- [:pending, :suspended, :running] do
+      {:ok, instance} =
+        Store.insert_workflow(config, %{
+          workflow_type: "Test",
+          status: status,
+          params: %{},
+          data: %{},
+          current_stage_index: 0,
+          pipeline_version: 1,
+          locked_until: past
+        })
+
+      assert instance.id in Enum.map(Store.list_reclaimable(config, now), & &1.id)
+    end
+
+    {:ok, pending_nil} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :pending,
+        params: %{},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1,
+        locked_until: nil
+      })
+
+    assert pending_nil.id in Enum.map(Store.list_reclaimable(config, now), & &1.id)
+  end
+
+  test "list_reclaimable excludes terminal and failed statuses", %{config: config} do
+    past = DateTime.add(DateTime.utc_now(), -60, :second)
+    now = DateTime.utc_now()
+
+    for status <- [:completed, :compensated, :cancelled, :failed, :compensating] do
+      {:ok, instance} =
+        Store.insert_workflow(config, %{
+          workflow_type: "Test",
+          status: status,
+          params: %{},
+          data: %{},
+          current_stage_index: 0,
+          pipeline_version: 1,
+          locked_until: past
+        })
+
+      refute instance.id in Enum.map(Store.list_reclaimable(config, now), & &1.id)
+    end
+  end
+
+  test "write_checkpoint appends multiple rows", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :running,
+        params: %{"value" => 1},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1
+      })
+
+    assert {:ok, _} =
+             Store.write_checkpoint(config, %{instance | current_stage_index: 1, data: %{"phase" => 1}})
+
+    assert {:ok, _} =
+             Store.write_checkpoint(config, %{instance | current_stage_index: 2, data: %{"phase" => 2}})
+
+    assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 0, config: config)
+    assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 1, config: config)
+    assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 2, config: config)
   end
 end

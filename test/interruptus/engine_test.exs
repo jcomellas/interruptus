@@ -2,7 +2,11 @@ defmodule Interruptus.EngineTest do
   use ExUnit.Case, async: true
 
   alias Interruptus.Engine
+  alias Interruptus.Test.Support.Workflows.Failing
+  alias Interruptus.Test.Support.Workflows.InvalidVerify
   alias Interruptus.Test.Support.Workflows.Simple
+  alias Interruptus.Test.Support.Workflows.Slow
+  alias Interruptus.Test.Support.Workflows.Suspendable
 
   setup do
     Process.delete(:last_saved)
@@ -27,5 +31,58 @@ defmodule Interruptus.EngineTest do
     assert {:completed, result} = Engine.run_from(Simple, command, 0)
     assert result.success
     assert result.data.result == 10
+  end
+
+  test "verify :failed returns error" do
+    Process.put(:verify_result, :failed)
+    command = Simple.new(%{value: 2})
+    [_, checkpoint] = Simple.flattened_pipelines()
+
+    assert {:error, :verify_failed} = Engine.run_segment(Simple, checkpoint, command)
+  end
+
+  test "invalid verify result returns error" do
+    command = InvalidVerify.new()
+    [checkpoint] = InvalidVerify.flattened_pipelines()
+
+    assert {:error, {:invalid_verify_result, :bogus}} =
+             Engine.run_segment(InvalidVerify, checkpoint, command)
+  end
+
+  test "suspend propagates from stage" do
+    command = Suspendable.new(%{token: "t1"})
+    [stage, checkpoint] = Suspendable.flattened_pipelines()
+
+    assert {:ok, command} = Engine.run_segment(Suspendable, stage, command)
+
+    assert {:suspend, :await_approval, %{token: "t1"}, updated} =
+             Engine.run_segment(Suspendable, checkpoint, command)
+
+    assert updated.data.step == 1
+  end
+
+  test "halt returns halted" do
+    command = Failing.new(%{id: "1"})
+    [_, checkpoint] = Failing.flattened_pipelines()
+
+    assert {:halted, halted} = Engine.run_segment(Failing, checkpoint, command)
+    assert halted.halted
+  end
+
+  test "run_from/4 resumes from intermediate index" do
+    command = Simple.new(%{value: 3})
+    [stage | _] = Simple.flattened_pipelines()
+
+    assert {:ok, doubled} = Engine.run_segment(Simple, stage, command)
+    assert {:completed, result} = Engine.run_from(Simple, doubled, 1)
+    assert result.success
+    assert result.data.result == 6
+  end
+
+  test "stage timeout returns error" do
+    command = Slow.new()
+    [stage] = Slow.flattened_pipelines()
+
+    assert {:error, :timeout} = Engine.run_segment(Slow, stage, command, timeout: 50)
   end
 end
