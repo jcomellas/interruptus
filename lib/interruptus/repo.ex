@@ -29,6 +29,26 @@ defmodule Interruptus.Repo do
   end
 
   @doc """
+  Returns whether the configured repo currently has an open transaction.
+
+  Used to reject nested Interruptus API calls (`start`/`resume`/`cancel`) that
+  would run as savepoints and race the runner against an uncommitted outer txn.
+
+  ## Arguments
+
+    * `config` - Interruptus config with `:repo`
+
+  ## Returns
+
+    * `true` when `config.repo` is inside `transaction/2`
+    * `false` otherwise
+  """
+  @spec in_transaction?(Config.t()) :: boolean()
+  def in_transaction?(%Config{repo: repo}) do
+    repo.in_transaction?()
+  end
+
+  @doc """
   Inserts an Ecto struct using the configured repo and prefix.
 
   ## Arguments

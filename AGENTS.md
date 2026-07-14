@@ -21,7 +21,8 @@ Interruptus OTP Tree
 Database (embedded via Interruptus.Migration)
 ├── interruptus_workflows             # Instance rows, locks, snapshots
 ├── interruptus_checkpoints           # Historical checkpoint audit trail
-└── interruptus_stage_attempts        # Per-stage execution log
+├── interruptus_stage_attempts        # Per-stage execution log
+└── interruptus_effects               # Idempotent effect markers (workflow_id + key)
 ```
 
 ### Claim / Recover Loop
@@ -32,6 +33,14 @@ Database (embedded via Interruptus.Migration)
 4. On suspend: persist snapshot, set `:suspended`, release lease, stop process.
 5. On crash: lease expires; `Interruptus.Recovery` reclaims and starts a new Runner.
 6. On complete: set `:completed`; Recovery never restarts terminal workflows.
+
+## Shared database notes
+
+- Stages run **outside** Interruptus transactions; stage DB writes and checkpoints commit independently (at-least-once).
+- Do not call `start`/`resume`/`cancel` inside `Repo.transaction` on the Interruptus-configured repo.
+- `lock_version` fences workflow-row updates only — not host-table writes from a stale runner.
+- Use `Interruptus.Effect` markers + `verify/1` for DB side effects; domain uniqueness still required for true safety.
+- For pool isolation: `{Interruptus, repo: MyApp.InterruptusRepo}` while stages use `MyApp.Repo`.
 
 ## Authoring Rules
 
@@ -102,10 +111,11 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 
 1. **At-least-once** between checkpoints — stages and verify may run more than once.
 2. **JSON-serializable state** — `params` and `data` must be JSON-encodable maps in v1.
-3. **Lease required for writes** — checkpoint/status updates require valid `lock_version`.
+3. **Lease required for writes** — checkpoint/status updates require valid `lock_version` (fences workflow rows only).
 4. **Terminal workflows are immutable** — `:completed`, `:compensated`, `:cancelled` are never restarted.
 5. **One active runner** — cluster-wide exclusivity via PostgreSQL row claim + heartbeat.
 6. **Initial checkpoint on start** — every workflow persists a snapshot at initiation.
+7. **No nested API transactions** — `start`/`resume`/`cancel`/`Claim.acquire` reject an open transaction on the configured repo.
 
 ## Conventions
 
@@ -113,6 +123,7 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 - Mirror **Oban** embedding: `Interruptus.Migration.up/0`, `Interruptus.Repo` wrapper.
 - Module layout under `lib/interruptus/`.
 - Public API on `Interruptus` module: `start/2`, `resume/1`, `cancel/1`, `status/1`.
+- Shared-DB effects: `Interruptus.Effect` markers + idempotent `verify/1`.
 - Use `:telemetry` for observability events.
 
 ## Implementation Phases

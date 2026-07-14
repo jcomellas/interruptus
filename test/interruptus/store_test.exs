@@ -115,4 +115,33 @@ defmodule Interruptus.StoreTest do
     assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 1, config: config)
     assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 2, config: config)
   end
+
+  test "checkpoint_progress updates row and writes audit atomically", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :running,
+        params: %{"value" => 1},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1
+      })
+
+    assert {:ok, updated} =
+             Store.checkpoint_progress(config, instance, %{
+               params: %{"value" => 2},
+               data: %{"phase" => "done"},
+               current_stage_index: 1
+             })
+
+    assert updated.current_stage_index == 1
+    assert updated.params == %{"value" => 2}
+    assert updated.data == %{"phase" => "done"}
+    assert :ok = Interruptus.Test.assert_checkpoint(instance.id, 1, config: config)
+
+    stale = %{updated | lock_version: updated.lock_version - 1}
+
+    assert {:error, :stale_lock} =
+             Store.checkpoint_progress(config, stale, %{current_stage_index: 2})
+  end
 end

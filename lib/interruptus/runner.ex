@@ -211,14 +211,12 @@ defmodule Interruptus.Runner do
     with {:ok, params} <- workflow_module.dump_params(command.params),
          {:ok, data} <- workflow_module.dump_data(command.data),
          {:ok, updated_instance} <-
-           Store.update_with_lock(config, instance, %{
+           Store.checkpoint_progress(config, instance, %{
              params: params,
              data: data,
              current_stage_index: next_index,
              errors: command.errors
-           }),
-         {:ok, _} <-
-           Store.write_checkpoint(config, %{updated_instance | current_stage_index: next_index}) do
+           }) do
       :telemetry.execute(
         [:interruptus, :workflow, :checkpoint],
         %{stage_index: next_index},
@@ -396,7 +394,8 @@ defmodule Interruptus.Runner do
         base
         | params: Map.merge(base.params, params),
           data: Map.merge(base.data, loaded_data),
-          errors: instance.errors
+          errors: instance.errors,
+          workflow_id: instance.id
       }
 
       {:ok, command}

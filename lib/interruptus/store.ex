@@ -125,6 +125,63 @@ defmodule Interruptus.Store do
   end
 
   @doc """
+  Atomically advances workflow progress and writes a checkpoint audit row.
+
+  Runs the optimistic lock update and checkpoint insert in a single transaction
+  so the instance row and audit trail cannot diverge mid-crash.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `instance` - instance with current `id` and `lock_version`
+    * `attrs` - fields to update on the workflow row (typically `params`, `data`,
+      `current_stage_index`, `errors`)
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - freshly loaded row after update
+    * `{:error, :stale_lock}` - another process updated the row first
+    * `{:error, %Ecto.Changeset{}}` - checkpoint insert validation failure
+  """
+  @spec checkpoint_progress(Config.t(), WorkflowInstance.t(), map()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :stale_lock | Ecto.Changeset.t()}
+  def checkpoint_progress(config, %WorkflowInstance{id: id, lock_version: version}, attrs) do
+    now = DateTime.utc_now()
+    set_fields = build_set_fields(attrs, now)
+
+    Repo.transaction(config, fn ->
+      {count, _} =
+        Repo.update_all(
+          config,
+          from(w in WorkflowInstance,
+            where: w.id == ^id and w.lock_version == ^version
+          ),
+          set: set_fields
+        )
+
+      case count do
+        0 ->
+          config.repo.rollback(:stale_lock)
+
+        1 ->
+          updated = get!(config, id)
+
+          case insert_checkpoint(config, updated) do
+            {:ok, _} ->
+              updated
+
+            {:error, changeset} ->
+              config.repo.rollback(changeset)
+          end
+      end
+    end)
+    |> case do
+      {:ok, updated} -> {:ok, updated}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Logs a stage attempt outcome.
 
   ## Arguments

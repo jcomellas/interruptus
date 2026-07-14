@@ -119,6 +119,7 @@ On terminal failure after restart exhaustion, invoke compensation functions in L
 erDiagram
   interruptus_workflows ||--o{ interruptus_checkpoints : has
   interruptus_workflows ||--o{ interruptus_stage_attempts : has
+  interruptus_workflows ||--o{ interruptus_effects : has
 
   interruptus_workflows {
     uuid id PK
@@ -155,17 +156,37 @@ erDiagram
     jsonb error
     datetime inserted_at
   }
+
+  interruptus_effects {
+    uuid id PK
+    uuid workflow_id FK
+    string effect_key
+    jsonb metadata
+    datetime inserted_at
+  }
 ```
+
+## Shared database and transactions
+
+Interruptus embeds in the host Postgres database. Stages run **outside** library transactions; checkpoint progress (workflow row + audit insert) is one short transaction after stages return.
+
+Implications:
+
+1. Stage side effects and Interruptus checkpoints are **not** one atomic unit.
+2. Between checkpoints, stages and verify may run at-least-once — use idempotent effects, domain unique keys, `verify/1`, and `Interruptus.Effect` markers.
+3. Do not call `start` / `resume` / `cancel` inside an open transaction on the configured Interruptus repo (`{:error, :in_transaction}`). Nested calls race the Runner against an uncommitted insert.
+4. `lock_version` fences workflow-row writes only. A stale runner after lease expiry can still commit host-table writes.
+5. A dedicated Interruptus Repo/pool (same DB URL) is recommended under load for connection isolation; nesting detection binds to that `:repo`.
 
 ## Concurrency and Failure Scenarios
 
 ### Split-brain after lease expiry
 
-Old runner may still be executing when lease expires. New runner claims with incremented `lock_version`. All writes use optimistic locking on `lock_version`; stale runner writes fail safely.
+Old runner may still be executing when lease expires. New runner claims with incremented `lock_version`. All Interruptus writes use optimistic locking on `lock_version`; stale runner writes to workflow rows fail safely. Host-table writes are not fenced — design stages accordingly.
 
 ### Duplicate verify execution
 
-Verify runs on every resume before segment stages. Must query external state idempotently (e.g., check payment status by idempotency key).
+Verify runs on every resume before segment stages. Must query external or durable state idempotently (e.g., payment status by idempotency key, or `Interruptus.Effect.exists?/3`).
 
 ### Stale lease / crashed node
 

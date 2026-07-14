@@ -15,9 +15,24 @@ defmodule Interruptus do
         {Interruptus, repo: MyApp.Repo}
       ]
 
+  For pool isolation under load, pass a dedicated Repo (same database URL, separate pool)
+  as `:repo`; stage code can keep using `MyApp.Repo`.
+
   Run `Interruptus.Migration.up/0` from your Ecto migrations (pass the same
   `:prefix` as your config when using a non-public schema), then define workflows
   with `Interruptus.Workflow` and start them via `start/3`.
+
+  ## Durability & transactions
+
+  Stages execute **outside** Interruptus transactions. Side effects and checkpoints
+  are separate commits (at-least-once between checkpoints). Use idempotent stage
+  bodies, `verify/1`, and `Interruptus.Effect` markers for shared-DB work.
+
+  Do not call `start/3`, `resume/2`, or `cancel/2` inside an open transaction on
+  the Interruptus-configured repo (`{:error, :in_transaction}`).
+
+  `lock_version` fences Interruptus workflow-row writes only — not host-table
+  mutations from a stale runner.
 
   ## Lifecycle
 
@@ -104,6 +119,8 @@ defmodule Interruptus do
 
     * `{:ok, %WorkflowInstance{}}` - instance row with generated `id`
     * `{:error, %Ecto.Changeset{}}` - validation or constraint failure on insert
+    * `{:error, :in_transaction}` - called inside an open transaction on the
+      Interruptus-configured repo (rejected to avoid nested-savepoint races)
     * `{:error, term()}` - runner could not be started
 
   ## Examples
@@ -116,7 +133,8 @@ defmodule Interruptus do
   def start(workflow_module, params, opts \\ []) do
     config = config_from_opts(opts)
 
-    with {:ok, cast_params} <- workflow_module.cast_params(params),
+    with :ok <- reject_in_transaction(config),
+         {:ok, cast_params} <- workflow_module.cast_params(params),
          {:ok, dumped_params} <- workflow_module.dump_params(cast_params),
          {:ok, dumped_data} <- workflow_module.dump_data(%{}),
          {:ok, instance} <-
@@ -160,13 +178,16 @@ defmodule Interruptus do
     * `{:ok, pid()}` - runner process pid (new or existing)
     * `{:error, :not_found}` - no row with that id
     * `{:error, :terminal}` - workflow is `:completed`, `:compensated`, or `:cancelled`
+    * `{:error, :in_transaction}` - called inside an open transaction on the
+      Interruptus-configured repo
     * `{:error, term()}` - runner could not be started
   """
   @spec resume(Ecto.UUID.t(), keyword()) :: {:ok, pid()} | {:error, term()}
   def resume(workflow_id, opts \\ []) do
     config = config_from_opts(opts)
 
-    with %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
+    with :ok <- reject_in_transaction(config),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
          false <- WorkflowInstance.terminal?(instance),
          workflow_module <- module_from_type(instance.workflow_type),
          {:ok, pid} <- RunnerSupervisor.start_runner(config, workflow_module, workflow_id) do
@@ -204,12 +225,15 @@ defmodule Interruptus do
     * `{:error, :not_found}` - no row with that id
     * `{:error, :terminal}` - workflow is already terminal
     * `{:error, :stale_lock}` - another runner holds a newer `lock_version`
+    * `{:error, :in_transaction}` - called inside an open transaction on the
+      Interruptus-configured repo
   """
   @spec cancel(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
   def cancel(workflow_id, opts \\ []) do
     config = config_from_opts(opts)
 
-    with %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
+    with :ok <- reject_in_transaction(config),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
          false <- WorkflowInstance.terminal?(instance),
          {:ok, cancelled} <-
            Store.update_with_lock(config, instance, %{
@@ -263,6 +287,15 @@ defmodule Interruptus do
     opts
     |> Keyword.get(:config, Interruptus)
     |> Config.fetch()
+  end
+
+  @spec reject_in_transaction(Config.t()) :: :ok | {:error, :in_transaction}
+  defp reject_in_transaction(config) do
+    if Interruptus.Repo.in_transaction?(config) do
+      {:error, :in_transaction}
+    else
+      :ok
+    end
   end
 
   @spec module_from_type(String.t()) :: module()

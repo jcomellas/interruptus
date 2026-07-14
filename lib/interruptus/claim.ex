@@ -29,10 +29,22 @@ defmodule Interruptus.Claim do
     * `{:ok, %WorkflowInstance{}}` - claimed instance with updated lease fields
     * `{:error, :not_claimable}` - workflow is terminal or lease not expired
     * `{:error, :not_found}` - no row with that id
+    * `{:error, :in_transaction}` - call site is already inside a DB transaction
   """
   @spec acquire(Config.t(), Ecto.UUID.t()) ::
-          {:ok, WorkflowInstance.t()} | {:error, :not_claimable | :not_found}
+          {:ok, WorkflowInstance.t()}
+          | {:error, :not_claimable | :not_found | :in_transaction}
   def acquire(config, workflow_id) do
+    if Repo.in_transaction?(config) do
+      {:error, :in_transaction}
+    else
+      do_acquire(config, workflow_id)
+    end
+  end
+
+  @spec do_acquire(Config.t(), Ecto.UUID.t()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :not_claimable | :not_found}
+  defp do_acquire(config, workflow_id) do
     now = DateTime.utc_now()
     locked_until = DateTime.add(now, config.lease_duration, :millisecond)
 

@@ -2,9 +2,9 @@ defmodule Interruptus.Migration do
   @moduledoc """
   Embedded migrations for Interruptus tables.
 
-  Creates `interruptus_workflows`, `interruptus_checkpoints`, and
-  `interruptus_stage_attempts` in the host database. Host applications wrap
-  these in their own `Ecto.Migration` modules:
+  Creates `interruptus_workflows`, `interruptus_checkpoints`,
+  `interruptus_stage_attempts`, and `interruptus_effects` in the host database.
+  Host applications wrap these in their own `Ecto.Migration` modules:
 
       defmodule MyApp.Repo.Migrations.AddInterruptus do
         use Ecto.Migration
@@ -22,7 +22,7 @@ defmodule Interruptus.Migration do
 
   use Ecto.Migration
 
-  @current_version 1
+  @current_version 2
 
   @doc """
   Runs all Interruptus migrations up to the current version.
@@ -82,10 +82,10 @@ defmodule Interruptus.Migration do
   defp migrated_version(opts) do
     prefix = Keyword.get(opts, :prefix)
 
-    if table_exists?("interruptus_workflows", prefix) do
-      @current_version
-    else
-      0
+    cond do
+      table_exists?("interruptus_effects", prefix) -> 2
+      table_exists?("interruptus_workflows", prefix) -> 1
+      true -> 0
     end
   end
 
@@ -189,7 +189,7 @@ defmodule Interruptus.Migration do
     :ok
   end
 
-  # Version 1 rollback: drops all Interruptus tables.
+  # Version 1 rollback: drops v1 Interruptus tables.
   @doc false
   @spec down1(keyword()) :: :ok
   def down1(opts \\ []) do
@@ -198,6 +198,57 @@ defmodule Interruptus.Migration do
     drop_if_exists table(:interruptus_stage_attempts, prefix: prefix)
     drop_if_exists table(:interruptus_checkpoints, prefix: prefix)
     drop_if_exists table(:interruptus_workflows, prefix: prefix)
+
+    :ok
+  end
+
+  # Version 2 migration: effect markers for idempotent stage side effects.
+  @doc false
+  @spec up2(keyword()) :: :ok
+  def up2(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    table_opts = [primary_key: false, prefix: prefix]
+
+    create_if_not_exists table(:interruptus_effects, table_opts) do
+      add :id, :binary_id, primary_key: true
+
+      add :workflow_id,
+          references(:interruptus_workflows,
+            type: :binary_id,
+            on_delete: :delete_all,
+            prefix: prefix
+          ),
+          null: false
+
+      add :effect_key, :string, null: false
+      add :metadata, :map, null: false, default: "{}"
+      add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    end
+
+    create_if_not_exists(
+      unique_index(:interruptus_effects, [:workflow_id, :effect_key],
+        name: :interruptus_effects_workflow_key_idx,
+        prefix: prefix
+      )
+    )
+
+    :ok
+  end
+
+  # Version 2 rollback: drops interruptus_effects.
+  @doc false
+  @spec down2(keyword()) :: :ok
+  def down2(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    drop_if_exists(
+      index(:interruptus_effects, [:workflow_id, :effect_key],
+        name: :interruptus_effects_workflow_key_idx,
+        prefix: prefix
+      )
+    )
+
+    drop_if_exists table(:interruptus_effects, prefix: prefix)
 
     :ok
   end

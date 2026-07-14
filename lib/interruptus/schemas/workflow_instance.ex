@@ -90,6 +90,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
 
     has_many :checkpoints, Interruptus.Schemas.Checkpoint, foreign_key: :workflow_id
     has_many :stage_attempts, Interruptus.Schemas.StageAttempt, foreign_key: :workflow_id
+    has_many :effects, Interruptus.Schemas.Effect, foreign_key: :workflow_id
 
     timestamps(type: :utc_datetime_usec)
   end

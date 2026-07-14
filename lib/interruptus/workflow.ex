@@ -65,6 +65,11 @@ defmodule Interruptus.Workflow do
 
   Verify functions must be idempotent and must not create duplicate side effects.
 
+  For shared-database side effects, prefer `Interruptus.Effect.exists?/3` in
+  verify and `Interruptus.Effect.once/4` in stages. Stages and Interruptus
+  checkpoints are **not** one database transaction — expect at-least-once
+  re-execution between checkpoints.
+
   ## Types
 
   See `Interruptus.Workflow.Segment` for the segment map type used in callbacks.
@@ -313,7 +318,8 @@ defmodule Interruptus.Workflow do
                 errors: %{},
                 params: unquote(Macro.escape(param_defaults)),
                 data: unquote(Macro.escape(data_defaults)),
-                pipelines: unquote(Macro.escape(flattened))
+                pipelines: unquote(Macro.escape(flattened)),
+                workflow_id: nil
 
       @type t :: %__MODULE__{
               success: boolean(),
@@ -321,7 +327,8 @@ defmodule Interruptus.Workflow do
               errors: map(),
               params: map(),
               data: map(),
-              pipelines: [Interruptus.Workflow.segment()]
+              pipelines: [Interruptus.Workflow.segment()],
+              workflow_id: Ecto.UUID.t() | nil
             }
 
       @doc """
@@ -455,7 +462,8 @@ defmodule Interruptus.Workflow do
           errors: %{},
           params: Map.merge(unquote(Macro.escape(param_defaults)), params),
           data: unquote(Macro.escape(data_defaults)),
-          pipelines: unquote(Macro.escape(flattened))
+          pipelines: unquote(Macro.escape(flattened)),
+          workflow_id: nil
         }
       end
 
