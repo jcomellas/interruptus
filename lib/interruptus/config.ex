@@ -10,7 +10,8 @@ defmodule Interruptus.Config do
   ## Struct fields
 
     * `:name` - config instance name atom (default `Interruptus`)
-    * `:repo` - host Ecto repo module (required)
+    * `:repo` - host Ecto repo module used for Interruptus persistence (required).
+      May be the application Repo or a dedicated pool Repo pointing at the same database.
     * `:prefix` - PostgreSQL schema prefix (default `"public"`)
     * `:node_id` - cluster node identifier for leases (defaults to `Node.self/0` as string)
     * `:lease_duration` - lease TTL in milliseconds (default `30_000`)
