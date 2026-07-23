@@ -90,4 +90,55 @@ defmodule Interruptus.IntegrationTest do
     assert {:ok, %{status: :cancelled}} = Interruptus.cancel(instance.id, config: config.name)
     assert {:error, :terminal} = Interruptus.resume(instance.id, config: config.name)
   end
+
+  test "start with duplicate idempotency_key returns the existing instance", %{config: config} do
+    key = "idem-#{System.unique_integer([:positive])}"
+
+    assert {:ok, first} =
+             Interruptus.start(Simple, %{value: 1}, config: config.name, idempotency_key: key)
+
+    assert {:ok, second} =
+             Interruptus.start(Simple, %{value: 99}, config: config.name, idempotency_key: key)
+
+    assert second.id == first.id
+    # Original params win; the retry did not overwrite them.
+    assert second.params == %{"value" => 1}
+  end
+
+  test "non-string suspend reasons are persisted via inspect", %{config: config} do
+    alias Interruptus.Test.Support.Workflows.WeirdSuspend
+
+    assert {:ok, instance} = Interruptus.start(WeirdSuspend, %{}, config: config.name)
+
+    assert {:ok, suspended} = Test.await_status(instance.id, :suspended, config: config)
+    assert suspended.suspend_reason == ~s({:waiting_for, "partner-bank", 42})
+  end
+
+  test "pipeline_version mismatch parks the workflow as suspended", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Simple",
+        status: :pending,
+        params: %{"value" => 1},
+        data: %{},
+        current_stage_index: 0,
+        # Simple compiles with pipeline_version 1.
+        pipeline_version: 999
+      })
+
+    assert {:ok, _pid} =
+             Interruptus.RunnerSupervisor.start_runner(config, Simple, instance.id)
+
+    assert {:ok, parked} =
+             Test.await_status(instance.id, :suspended, config: config, timeout: 5_000)
+
+    assert parked.suspend_reason == "pipeline_version_mismatch"
+    assert parked.suspend_metadata == %{"stored" => 999, "compiled" => 1}
+    assert parked.locked_by == nil
+
+    # Recovery never picks it back up; stages never ran.
+    :ok = Interruptus.Recovery.recover_all(config)
+    refute Test.runner_pid(instance.id)
+    assert {:ok, %{status: :suspended}} = Interruptus.status(instance.id, config: config.name)
+  end
 end

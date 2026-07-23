@@ -25,6 +25,8 @@ defmodule Interruptus.Effect do
 
   import Ecto.Query
 
+  require Logger
+
   alias Interruptus.Config
   alias Interruptus.Repo
   alias Interruptus.Schemas.Effect
@@ -121,9 +123,21 @@ defmodule Interruptus.Effect do
   Runs `fun` once per `(workflow_id, effect_key)`, recording a marker on success.
 
   If a marker already exists, returns `command` unchanged without calling `fun`.
-  On a successful non-suspend command result, inserts the marker (unique races
-  after success are treated as ok). Suspend tuples and raised errors do not
-  insert a marker.
+  On a successful non-suspend, non-halted command result, inserts the marker
+  (unique races after success are treated as ok). No marker is written when:
+
+  * `fun` returns a suspend tuple,
+  * `fun` returns a **halted** command (`halted: true`) — the stage signalled
+    failure, so the effect must not be considered applied on replay,
+  * `fun` raises (the exception propagates).
+
+  A marker insert failure other than a duplicate is logged and the result is
+  still returned; the effect will re-run on replay (at-least-once).
+
+  Note: markers protect against **sequential** replay after crashes and
+  retries. They do not serialize two runners executing concurrently during a
+  lease-expiry window — both may pass `exists?/3` before either inserts. Use
+  domain unique constraints for hard once-only guarantees.
 
   ## Arguments
 
@@ -147,13 +161,26 @@ defmodule Interruptus.Effect do
         {:suspend, _reason, _metadata} = suspended ->
           suspended
 
+        %{halted: true} = halted ->
+          halted
+
         %{} = result ->
           metadata = Keyword.get(opts, :metadata, %{})
 
           case put(command, effect_key, metadata, opts) do
-            {:ok, _} -> result
-            {:error, :already_exists} -> result
-            {:error, _} -> result
+            {:ok, _} ->
+              result
+
+            {:error, :already_exists} ->
+              result
+
+            {:error, reason} ->
+              Logger.warning(
+                "interruptus effect marker insert failed effect_key=#{effect_key}: " <>
+                  "#{inspect(reason)}; effect will re-run on replay"
+              )
+
+              result
           end
       end
     end
@@ -169,7 +196,9 @@ defmodule Interruptus.Effect do
   @spec unique_conflict?([tuple()]) :: boolean()
   defp unique_conflict?(errors) do
     Enum.any?(errors, fn
-      {:effect_key, {_, [constraint: :unique, constraint_name: _]}} -> true
+      {:effect_key, {_, [constraint: :unique, constraint_name: _]}} ->
+        true
+
       {_field, {_, [constraint: :unique, constraint_name: name]}} ->
         name in [:interruptus_effects_workflow_key_idx, "interruptus_effects_workflow_key_idx"]
 

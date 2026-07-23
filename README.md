@@ -16,12 +16,16 @@ end
 
 ```elixir
 # config/config.exs
-config :my_app, Interruptus,
+config :interruptus, Interruptus,
   repo: MyApp.Repo,
   prefix: "public",
-  node_id: "node-1",
   lease_duration: 30_000,
-  heartbeat_interval: 10_000
+  heartbeat_interval: 10_000,
+  recovery_interval: 5_000
+
+# :node_id defaults to "#{Node.self()}/<random-boot-token>", which is safe for
+# multi-node deployments even without distributed Erlang. Set it explicitly if
+# you want stable lease attribution across restarts.
 
 # application.ex — shared repo (simple) or dedicated pool (recommended under load)
 children = [
@@ -64,21 +68,56 @@ defmodule MyApp.TransferFunds do
     param :amount, :decimal
 
     data :debit_ref, :string
+    data :credit_ref, :string
+
+    stage_timeout 30_000
 
     pipeline :validate
 
-    checkpoint do
+    # Per-checkpoint compensations (preferred): run in LIFO order during
+    # rollback, but only for checkpoints the workflow actually passed.
+    checkpoint compensate: :reverse_debit do
       verify :verify_debit
       pipeline :debit_account
     end
 
+    checkpoint compensate: :reverse_credit do
+      verify :verify_credit
+      pipeline :credit_account
+    end
+
     restart_policy max_attempts: 3, backoff: :exponential
-    rollback_policy compensate: [:reverse_debit]
   end
 end
 
-{:ok, workflow} = Interruptus.start(MyApp.TransferFunds, %{from_account_id: 1, amount: "100.00"})
+# Idempotent start: retrying with the same key returns the existing instance.
+{:ok, workflow} =
+  Interruptus.start(MyApp.TransferFunds, %{from_account_id: 1, amount: "100.00"},
+    idempotency_key: "transfer-1234"
+  )
 ```
+
+## Lifecycle semantics
+
+- **Retries are bounded across crashes** — `attempt_count` is persisted *before*
+  each execution attempt, so a crash-looping workflow ends in rollback after
+  `max_attempts`, never in an infinite reclaim loop. Raised exceptions, throws,
+  exits, timeouts, and `halt/2` all flow through the restart policy.
+- **Suspension is explicit** — a `:suspended` workflow is never auto-resumed by
+  recovery. `Interruptus.resume/2` performs a fenced `suspended → pending`
+  transition. A `:failed` workflow resumes into `:compensating` to retry rollback.
+- **Compensation is durable** — `compensation_index` is persisted after each
+  compensation function; a crash mid-rollback is reclaimed and resumes from the
+  last completed step. Compensations run only for checkpoints that were passed.
+- **Cancel fences live runners** — `Interruptus.cancel/2` bumps the fencing
+  token; a running runner (even with a valid lease) fails its next write and
+  stops. `cancel(id, compensate: true)` rolls back passed checkpoints instead
+  (ends `:compensated`).
+- **Long stages are safe** — lease heartbeats renew concurrently with stage
+  execution, so a stage longer than `lease_duration` does not lose exclusivity.
+- **Deploy skew is detected** — a persisted `pipeline_version` that differs from
+  the compiled workflow parks the instance as `:suspended`
+  (`"pipeline_version_mismatch"`) instead of misexecuting positional indexes.
 
 ## Durability and the database
 
@@ -86,8 +125,8 @@ Interruptus persists workflow state in the host application's PostgreSQL databas
 
 - Stage DB writes and checkpoint writes are **independent commits** — not one atomic unit.
 - Segments between checkpoints may run **at-least-once** after a crash; use idempotent side effects, domain unique constraints, and checkpoint `verify/1`.
-- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay.
-- `lock_version` fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry.
+- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay. Markers are not written for halted or suspended results, and they do not defend against two runners racing in a lease-expiry window — use domain unique constraints for hard once-only guarantees.
+- `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry.
 
 ### Do not nest API calls in transactions
 

@@ -2,39 +2,21 @@ defmodule Interruptus.Application do
   @moduledoc """
   OTP application callback for the `:interruptus` application.
 
-  Starts the internal supervision tree when Interruptus is listed as a
-  dependency application (library mode). Host applications typically start
-  Interruptus via `{Interruptus, repo: MyApp.Repo}` instead.
-
-  ## Supervision tree
-
-    * `Interruptus.Registry` — workflow_id → runner pid
-    * `Interruptus.RunnerSupervisor` — DynamicSupervisor for runners
-    * `Interruptus.Recovery` — periodic stale-workflow reclaim
+  Intentionally starts **no** runtime processes. The Interruptus supervision
+  tree (Registry, RunnerSupervisor, Task.Supervisor, Recovery) is per-instance
+  and runs under the **host** application's supervisor via
+  `{Interruptus, repo: MyApp.Repo}` — see `Interruptus.Supervisor`. Starting
+  the tree in the host tree guarantees it boots after the host Repo and allows
+  multiple named instances in one VM.
   """
 
   use Application
 
-  # Application start callback. Starts Interruptus.Supervisor with :one_for_one strategy.
+  # Application start callback. No global children; see moduledoc.
   @doc false
   @spec start(Application.start_type(), [term()]) :: Supervisor.on_start()
   @impl true
   def start(_type, _args) do
-    children = [
-      {Registry, keys: :unique, name: Interruptus.Registry},
-      Interruptus.RunnerSupervisor,
-      {Interruptus.Recovery, recovery_opts()}
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: Interruptus.Supervisor)
-  end
-
-  @spec recovery_opts() :: keyword()
-  defp recovery_opts do
-    if Application.get_env(:interruptus, :recovery_schedule, true) do
-      []
-    else
-      [schedule: false]
-    end
+    Supervisor.start_link([], strategy: :one_for_one, name: Interruptus.ApplicationSupervisor)
   end
 end

@@ -18,7 +18,9 @@ defmodule Interruptus.Test.Support.Workflows.VerifyFlip do
       pipeline :apply_result
     end
 
-    restart_policy max_attempts: 1, backoff: :constant, base_interval: 10
+    # Crash-recovery reclaims consume attempts (durable pre-execution attempt
+    # accounting), so allow enough budget for the interruption tests.
+    restart_policy max_attempts: 3, backoff: :constant, base_interval: 10
     rollback_policy compensate: [:undo]
   end
 

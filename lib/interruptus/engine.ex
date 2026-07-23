@@ -8,6 +8,14 @@ defmodule Interruptus.Engine do
 
   Checkpoint segments optionally call a `verify/1` function before running pipelines.
   Verify must return `:done`, `:not_done`, or `:failed` and must be idempotent.
+
+  ## Failure containment
+
+  Exceptions, throws, and exits raised by stage or verify functions are caught
+  and returned as `{:error, {:exception | :throw | :exit, ...}}` tuples. This
+  lets `Interruptus.Runner` route crashes through the workflow restart policy
+  (bounded attempts, then rollback) instead of crash-looping the runner
+  process.
   """
 
   alias Interruptus.Command
@@ -43,6 +51,7 @@ defmodule Interruptus.Engine do
     * `{:error, {:invalid_verify_result, term()}}` - verify returned unexpected value
     * `{:error, :timeout}` - stage exceeded timeout
     * `{:error, {:invalid_stage_result, term()}}` - stage returned unexpected value
+    * `{:error, {:exception, Exception.t(), stacktrace}}` - stage or verify raised
     * `{:error, term()}` - stage task exited with reason
 
   ## Examples
@@ -159,6 +168,12 @@ defmodule Interruptus.Engine do
       :failed -> {:error, :verify_failed}
       other -> {:error, {:invalid_verify_result, other}}
     end
+  rescue
+    exception ->
+      {:error, {:exception, exception, __STACKTRACE__}}
+  catch
+    :throw, value -> {:error, {:throw, value}}
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   @spec run_pipelines(module(), [atom()], Command.t(), :infinity | pos_integer()) ::
@@ -190,36 +205,49 @@ defmodule Interruptus.Engine do
           | {:suspend, term(), map(), Command.t()}
           | {:error, term()}
   defp run_stage(_workflow_module, name, command, :infinity) do
+    safe_apply(command, name)
+  end
+
+  defp run_stage(_workflow_module, name, command, timeout) when is_integer(timeout) do
+    task =
+      Task.async(fn ->
+        safe_apply(command, name)
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} ->
+        result
+
+      nil ->
+        {:error, :timeout}
+
+      {:exit, reason} ->
+        {:error, {:exit, reason}}
+    end
+  end
+
+  # Invokes a stage function, containing raises/throws/exits as error tuples
+  # so the runner can apply the restart policy instead of crashing.
+  @spec safe_apply(Command.t(), atom()) ::
+          {:ok, Command.t()}
+          | {:suspend, term(), map(), Command.t()}
+          | {:error, term()}
+  defp safe_apply(command, name) do
     case Command.apply_fun(command, name) do
       {:suspend, reason, metadata} ->
         {:suspend, reason, metadata, command}
 
       %{} = result ->
         {:ok, result}
-    end
-  end
 
-  defp run_stage(_workflow_module, name, command, timeout) when is_integer(timeout) do
-    task =
-      Task.async(fn ->
-        Command.apply_fun(command, name)
-      end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {:suspend, reason, metadata}} ->
-        {:suspend, reason, metadata, command}
-
-      {:ok, %{} = result} ->
-        {:ok, result}
-
-      {:ok, other} ->
+      other ->
         {:error, {:invalid_stage_result, other}}
-
-      nil ->
-        {:error, :timeout}
-
-      {:exit, reason} ->
-        {:error, reason}
     end
+  rescue
+    exception ->
+      {:error, {:exception, exception, __STACKTRACE__}}
+  catch
+    :throw, value -> {:error, {:throw, value}}
+    :exit, reason -> {:error, {:exit, reason}}
   end
 end

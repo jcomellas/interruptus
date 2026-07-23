@@ -112,10 +112,16 @@ defmodule Interruptus.Test do
 
   @doc """
   Returns the registered runner pid for a workflow, or `nil`.
+
+  ## Options
+
+    * `:config` - Interruptus config struct or name (default `Interruptus.Config.fetch/0`)
   """
-  @spec runner_pid(Ecto.UUID.t()) :: pid() | nil
-  def runner_pid(workflow_id) do
-    case Registry.lookup(Interruptus.Registry, workflow_id) do
+  @spec runner_pid(Ecto.UUID.t(), keyword()) :: pid() | nil
+  def runner_pid(workflow_id, opts \\ []) do
+    config = resolve_config(opts)
+
+    case Registry.lookup(Config.registry_name(config), workflow_id) do
       [{pid, _}] -> pid
       [] -> nil
     end
@@ -127,32 +133,50 @@ defmodule Interruptus.Test do
   After the lease expires, `Interruptus.Recovery` should reclaim and restart
   execution. Use with `expire_lease/2` and `await_status/3` to verify recovery.
 
+  ## Options
+
+    * `:config` - Interruptus config struct or name (default `Interruptus.Config.fetch/0`)
+
   ## Returns
 
     * `:ok` - runner was killed
     * `{:error, :not_running}` - no runner registered for this id
   """
-  @spec crash_runner(Ecto.UUID.t()) :: :ok | {:error, :not_running}
-  def crash_runner(workflow_id) do
-    case runner_pid(workflow_id) do
+  @spec crash_runner(Ecto.UUID.t(), keyword()) :: :ok | {:error, :not_running}
+  def crash_runner(workflow_id, opts \\ []) do
+    config = resolve_config(opts)
+
+    case runner_pid(workflow_id, opts) do
       nil ->
         {:error, :not_running}
 
       pid ->
-        _ = DynamicSupervisor.terminate_child(Interruptus.RunnerSupervisor, pid)
-        wait_for_runner_exit(workflow_id)
+        _ =
+          DynamicSupervisor.terminate_child(Config.runner_supervisor_name(config), pid)
+
+        wait_for_runner_exit(workflow_id, opts)
     end
   end
 
-  @spec wait_for_runner_exit(Ecto.UUID.t()) :: :ok
-  defp wait_for_runner_exit(workflow_id) do
+  @spec wait_for_runner_exit(Ecto.UUID.t(), keyword()) :: :ok
+  defp wait_for_runner_exit(workflow_id, opts) do
     deadline = System.monotonic_time(:millisecond) + 2_000
 
-    if runner_pid(workflow_id) == nil or System.monotonic_time(:millisecond) >= deadline do
+    if runner_pid(workflow_id, opts) == nil or
+         System.monotonic_time(:millisecond) >= deadline do
       :ok
     else
       Process.sleep(20)
-      wait_for_runner_exit(workflow_id)
+      wait_for_runner_exit(workflow_id, opts)
+    end
+  end
+
+  @spec resolve_config(keyword()) :: Config.t()
+  defp resolve_config(opts) do
+    case Keyword.get(opts, :config) do
+      %Config{} = config -> config
+      nil -> Config.fetch()
+      name when is_atom(name) -> Config.fetch(name)
     end
   end
 

@@ -23,7 +23,7 @@ defmodule Interruptus.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :telemetry],
+      extra_applications: [:logger, :telemetry, :crypto],
       mod: {Interruptus.Application, []}
     ]
   end

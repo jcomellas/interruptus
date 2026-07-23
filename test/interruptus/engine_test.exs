@@ -85,4 +85,33 @@ defmodule Interruptus.EngineTest do
 
     assert {:error, :timeout} = Engine.run_segment(Slow, stage, command, timeout: 50)
   end
+
+  test "raised exceptions are contained as error tuples" do
+    alias Interruptus.Test.Support.Workflows.Raising
+
+    command = Raising.new(%{id: "e1"})
+    [_first, boom_segment | _] = Raising.flattened_pipelines()
+
+    assert {:error, {:exception, %RuntimeError{message: message}, stacktrace}} =
+             Engine.run_segment(Raising, boom_segment, command)
+
+    assert message =~ "boom stage always raises"
+    assert is_list(stacktrace)
+
+    # Same containment on the timeout execution path.
+    assert {:error, {:exception, %RuntimeError{}, _}} =
+             Engine.run_segment(Raising, boom_segment, command, timeout: 5_000)
+  end
+
+  test "invalid stage return values are errors, not crashes" do
+    alias Interruptus.Test.Support.Workflows.BadReturn
+
+    command = BadReturn.new()
+    [segment] = BadReturn.flattened_pipelines()
+
+    assert {:error, {:invalid_stage_result, :oops}} = Engine.run_segment(BadReturn, segment, command)
+
+    assert {:error, {:invalid_stage_result, :oops}} =
+             Engine.run_segment(BadReturn, segment, command, timeout: 5_000)
+  end
 end

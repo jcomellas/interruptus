@@ -22,7 +22,7 @@ defmodule Interruptus.Migration do
 
   use Ecto.Migration
 
-  @current_version 2
+  @current_version 3
 
   @doc """
   Runs all Interruptus migrations up to the current version.
@@ -83,6 +83,7 @@ defmodule Interruptus.Migration do
     prefix = Keyword.get(opts, :prefix)
 
     cond do
+      column_exists?("interruptus_workflows", "compensation_index", prefix) -> 3
       table_exists?("interruptus_effects", prefix) -> 2
       table_exists?("interruptus_workflows", prefix) -> 1
       true -> 0
@@ -92,6 +93,24 @@ defmodule Interruptus.Migration do
   @spec table_exists?(String.t(), String.t() | nil) :: boolean()
   defp table_exists?(table, prefix) do
     Ecto.Adapters.SQL.table_exists?(repo(), table, prefix: prefix)
+  rescue
+    _ -> false
+  end
+
+  @spec column_exists?(String.t(), String.t(), String.t() | nil) :: boolean()
+  defp column_exists?(table, column, prefix) do
+    schema = prefix || "public"
+
+    %{rows: rows} =
+      repo().query!(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        """,
+        [schema, table, column]
+      )
+
+    rows != []
   rescue
     _ -> false
   end
@@ -231,6 +250,32 @@ defmodule Interruptus.Migration do
         prefix: prefix
       )
     )
+
+    :ok
+  end
+
+  # Version 3 migration: durable compensation progress tracking.
+  @doc false
+  @spec up3(keyword()) :: :ok
+  def up3(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      add_if_not_exists :compensation_index, :integer, null: false, default: 0
+    end
+
+    :ok
+  end
+
+  # Version 3 rollback: drops compensation_index.
+  @doc false
+  @spec down3(keyword()) :: :ok
+  def down3(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      remove_if_exists :compensation_index, :integer
+    end
 
     :ok
   end

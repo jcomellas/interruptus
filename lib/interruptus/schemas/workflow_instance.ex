@@ -7,22 +7,33 @@ defmodule Interruptus.Schemas.WorkflowInstance do
 
   ## Status lifecycle
 
-    * `:pending` — inserted, awaiting first claim
+    * `:pending` — inserted (or resumed), awaiting claim
     * `:running` — runner holds a lease and is executing
-    * `:suspended` — voluntarily paused; resume with `Interruptus.resume/2`
+    * `:suspended` — voluntarily paused; only `Interruptus.resume/2` restarts it
     * `:completed` — all segments finished successfully (terminal)
-    * `:failed` — terminal failure after retries and compensation errors
-    * `:compensating` — rollback in progress
+    * `:failed` — failure with no compensations to run, or compensation
+      exhaustion; `Interruptus.resume/2` retries compensation
+    * `:compensating` — rollback in progress; reclaimable after lease expiry
     * `:compensated` — rollback completed (terminal)
     * `:cancelled` — cancelled via `Interruptus.cancel/2` (terminal)
 
   Terminal statuses (`:completed`, `:compensated`, `:cancelled`) are never restarted.
 
-  ## Lease fields
+  ## Lease and fencing fields
 
     * `locked_by` — node id of the claiming runner
     * `locked_until` — lease expiry; reclaimable when in the past
-    * `lock_version` — optimistic lock incremented on each claim/update
+    * `lock_version` — fencing token. Incremented by **every** state-changing
+      write (claim, checkpoint, attempt accounting, status transitions, cancel,
+      resume). Lease renewal (`Interruptus.Claim.renew/2`) extends `locked_until`
+      without bumping the version so external API writes do not race heartbeats.
+
+  ## Progress fields
+
+    * `current_stage_index` — next flattened segment to execute
+    * `attempt_count` — persisted **before** each execution attempt of the
+      current segment span; reset to `0` on every successful checkpoint
+    * `compensation_index` — number of compensation functions already applied
   """
 
   use Ecto.Schema
@@ -55,6 +66,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
           locked_until: DateTime.t() | nil,
           lock_version: integer(),
           attempt_count: integer(),
+          compensation_index: integer(),
           suspend_reason: String.t() | nil,
           suspend_metadata: map() | nil,
           errors: map(),
@@ -72,6 +84,8 @@ defmodule Interruptus.Schemas.WorkflowInstance do
     compensating compensated cancelled
   )a
 
+  @claimable_statuses ~w(pending running compensating)a
+
   schema "interruptus_workflows" do
     field :workflow_type, :string
     field :status, Ecto.Enum, values: @statuses, default: :pending
@@ -84,6 +98,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
     field :locked_until, :utc_datetime_usec
     field :lock_version, :integer, default: 0
     field :attempt_count, :integer, default: 0
+    field :compensation_index, :integer, default: 0
     field :suspend_reason, :string
     field :suspend_metadata, :map
     field :errors, :map, default: %{}
@@ -112,12 +127,14 @@ defmodule Interruptus.Schemas.WorkflowInstance do
       :locked_until,
       :lock_version,
       :attempt_count,
+      :compensation_index,
       :suspend_reason,
       :suspend_metadata,
       :errors
     ])
     |> validate_required([:workflow_type, :status])
     |> validate_inclusion(:status, @statuses)
+    |> unique_constraint(:idempotency_key, name: :interruptus_workflows_idempotency_idx)
   end
 
   @doc """
@@ -151,8 +168,13 @@ defmodule Interruptus.Schemas.WorkflowInstance do
   @doc """
   Returns whether the workflow can be claimed for execution.
 
-  Claimable when status is `:pending`, `:suspended`, or `:running` and the
+  Claimable when status is `:pending`, `:running`, or `:compensating` and the
   lease has expired (`locked_until` is `nil` or before `now`).
+
+  `:suspended` workflows are **not** claimable: only an explicit
+  `Interruptus.resume/2` (which transitions them to `:pending`) makes them
+  runnable again. `:failed` workflows are resumed into `:compensating` the same
+  way.
 
   ## Arguments
 
@@ -175,6 +197,12 @@ defmodule Interruptus.Schemas.WorkflowInstance do
       iex> Interruptus.Schemas.WorkflowInstance.claimable?(instance, "node@host", now)
       true
       iex> instance = %Interruptus.Schemas.WorkflowInstance{
+      ...>   status: :suspended,
+      ...>   locked_until: nil
+      ...> }
+      iex> Interruptus.Schemas.WorkflowInstance.claimable?(instance, "node@host", now)
+      false
+      iex> instance = %Interruptus.Schemas.WorkflowInstance{
       ...>   status: :running,
       ...>   locked_until: ~U[2025-01-01 13:00:00Z]
       ...> }
@@ -183,8 +211,12 @@ defmodule Interruptus.Schemas.WorkflowInstance do
   """
   @spec claimable?(t(), String.t(), DateTime.t()) :: boolean()
   def claimable?(%__MODULE__{status: status, locked_until: locked_until}, _node_id, now) do
-    status in [:pending, :suspended, :running] and lease_expired?(locked_until, now)
+    status in @claimable_statuses and lease_expired?(locked_until, now)
   end
+
+  @doc false
+  @spec claimable_statuses() :: [status()]
+  def claimable_statuses, do: @claimable_statuses
 
   @spec lease_expired?(DateTime.t() | nil, DateTime.t()) :: boolean()
   defp lease_expired?(nil, _now), do: true

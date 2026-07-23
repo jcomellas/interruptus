@@ -11,12 +11,13 @@ Host Application
 ├── {Interruptus, repo: MyApp.Repo}     # OTP child under application supervisor
 └── MyApp.Repo                        # Host-owned Ecto repo
 
-Interruptus OTP Tree
+Interruptus OTP Tree (per instance, names derived from config :name)
 ├── Interruptus.Supervisor
 │   ├── Interruptus.Registry          # workflow_id → Runner pid
-│   ├── Interruptus.Recovery          # Boot scan + stale lease reclaim
-│   └── Interruptus.RunnerSupervisor  # DynamicSupervisor for runners
-└── Interruptus.Runner (per instance) # GenServer executing pipeline segments
+│   ├── Interruptus.TaskSupervisor    # Task.Supervisor executing stage segments
+│   ├── Interruptus.RunnerSupervisor  # DynamicSupervisor for runners
+│   └── Interruptus.Recovery          # Boot scan + stale lease reclaim (jittered)
+└── Interruptus.Runner (per workflow) # GenServer driving segments + heartbeat
 
 Database (embedded via Interruptus.Migration)
 ├── interruptus_workflows             # Instance rows, locks, snapshots
@@ -27,12 +28,20 @@ Database (embedded via Interruptus.Migration)
 
 ### Claim / Recover Loop
 
-1. `Interruptus.start/2` inserts a `:pending` workflow row and starts a Runner.
-2. Runner claims the row (`locked_by`, `locked_until`, `lock_version`) in a transaction.
-3. Runner executes segments: verify → stages → checkpoint → advance.
+1. `Interruptus.start/3` inserts a `:pending` workflow row and starts a Runner
+   (idempotent when `:idempotency_key` is given — duplicate returns existing row).
+2. Runner claims the row (`FOR UPDATE SKIP LOCKED`; bumps `lock_version`).
+   A runner that cannot claim stops immediately. A `pipeline_version` mismatch
+   parks the row as `:suspended` (`"pipeline_version_mismatch"`).
+3. Runner persists `attempt_count + 1` (fenced), then executes the segment in
+   a `Task.Supervisor` task: verify → stages → checkpoint → advance. Heartbeats
+   renew the lease concurrently with execution. Checkpoints reset the budget.
 4. On suspend: persist snapshot, set `:suspended`, release lease, stop process.
-5. On crash: lease expires; `Interruptus.Recovery` reclaims and starts a new Runner.
-6. On complete: set `:completed`; Recovery never restarts terminal workflows.
+5. On crash: lease expires; `Interruptus.Recovery` reclaims (`:pending`,
+   `:running`, `:compensating` — never `:suspended`) and starts a new Runner.
+6. On failure after retries: compensation runs step-by-step, persisting
+   `compensation_index` (crash-resumable); ends `:compensated` or `:failed`.
+7. On complete: set `:completed`; Recovery never restarts terminal workflows.
 
 ## Shared database notes
 
@@ -58,14 +67,16 @@ defmodule MyApp.TransferFunds do
     data :debit_ref, :string
     data :credit_ref, :string
 
+    stage_timeout 30_000
+
     pipeline :validate_accounts
 
-    checkpoint do
+    checkpoint compensate: :reverse_debit do
       verify :verify_debit_applied/1
       pipeline :debit_account
     end
 
-    checkpoint do
+    checkpoint compensate: :reverse_credit do
       verify :verify_credit_applied/1
       pipeline :credit_account
     end
@@ -73,16 +84,21 @@ defmodule MyApp.TransferFunds do
     pipeline :send_receipt
 
     restart_policy max_attempts: 5, backoff: :exponential
-    rollback_policy compensate: [:reverse_debit, :reverse_credit]
   end
 end
 ```
+
+Per-checkpoint `compensate:` is preferred — rollback runs LIFO over checkpoints
+the workflow actually passed. `rollback_policy compensate: [...]` still works as
+a workflow-level list appended after the per-checkpoint compensations.
 
 ### Stage return values
 
 - Return the command struct for normal progress.
 - `{:suspend, reason, metadata}` — voluntary suspension; no process held until resume.
 - `halt/1` — stop forward progress; triggers restart or rollback per policy.
+- Raised exceptions, throws, exits, invalid returns, and `stage_timeout` expiry
+  are contained and routed through the restart policy (no crash loops).
 
 ### Typed fields
 
@@ -104,25 +120,29 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 
 ### Policies
 
-- **restart_policy** — `max_attempts`, `backoff` (`:constant`, `:exponential`), optional `retryable_errors`.
-- **rollback_policy** — `compensate: [...]` list of functions invoked LIFO on terminal failure.
+- **restart_policy** — `max_attempts`, `backoff` (`:constant`, `:exponential`), optional `retryable_errors`. Attempts are persisted **before** execution and reset at each checkpoint, so budgets hold across crashes.
+- **rollback_policy** — workflow-level `compensate: [...]` list appended after per-checkpoint compensations; invoked LIFO on terminal failure. Compensation progress is persisted per step (`compensation_index`) and crash-resumable.
 
 ## Invariants
 
 1. **At-least-once** between checkpoints — stages and verify may run more than once.
 2. **JSON-serializable state** — `params` and `data` must be JSON-encodable maps in v1.
-3. **Lease required for writes** — checkpoint/status updates require valid `lock_version` (fences workflow rows only).
+3. **Fenced writes everywhere** — every state-changing write bumps `lock_version`; runner writes additionally require `locked_by = node AND locked_until > now()`. Renewal extends the lease without a bump. Fences workflow rows only.
 4. **Terminal workflows are immutable** — `:completed`, `:compensated`, `:cancelled` are never restarted.
-5. **One active runner** — cluster-wide exclusivity via PostgreSQL row claim + heartbeat.
+5. **One active runner** — cluster-wide exclusivity via PostgreSQL row claim (`SKIP LOCKED`) + heartbeat; heartbeats renew concurrently with stage execution.
 6. **Initial checkpoint on start** — every workflow persists a snapshot at initiation.
 7. **No nested API transactions** — `start`/`resume`/`cancel`/`Claim.acquire` reject an open transaction on the configured repo.
+8. **Attempts persisted pre-execution** — crash loops are bounded by `max_attempts` and end in rollback (or `:failed` when nothing is compensable).
+9. **Suspension requires explicit resume** — Recovery reclaims `:pending`/`:running`/`:compensating` only; `resume/2` transitions `:suspended → :pending` and `:failed → :compensating` with a fenced write.
+10. **Version-checked claims** — a `pipeline_version` mismatch parks the workflow as `:suspended` (`"pipeline_version_mismatch"`); unresolvable `workflow_type` rows are skipped by recovery, never mutated.
 
 ## Conventions
 
-- Workflow DSL: `param/3`, `data/3`, `pipeline`, `halt/1`, `put_data/3`, `put_error/3`.
+- Workflow DSL: `param/3`, `data/3`, `pipeline`, `checkpoint` (with `compensate:`), `stage_timeout/1`, `halt/1`, `put_data/3`, `put_error/3`.
 - Mirror **Oban** embedding: `Interruptus.Migration.up/0`, `Interruptus.Repo` wrapper.
 - Module layout under `lib/interruptus/`.
-- Public API on `Interruptus` module: `start/2`, `resume/1`, `cancel/1`, `status/1`.
+- Public API on `Interruptus` module: `start/3`, `resume/2`, `cancel/2` (supports `compensate: true`), `status/2`. Start is idempotent per `idempotency_key`.
+- Per-instance OTP tree started by `{Interruptus, repo: ...}` in the **host** supervisor; process names derive from config `:name`.
 - Shared-DB effects: `Interruptus.Effect` markers + idempotent `verify/1`.
 - Use `:telemetry` for observability events.
 

@@ -10,5 +10,6 @@ defmodule Interruptus.Test.Support.Workflows.TypedFields do
 
     data :name, :string
     data :count, :integer
+    data :flag, :boolean
   end
 end

@@ -58,6 +58,24 @@ defmodule Interruptus.EffectTest do
     assert :counters.get(counter, 1) == 1
   end
 
+  test "once does not record marker when the stage halts", %{config: config, command: command} do
+    counter = :counters.new(1, [])
+
+    fun = fn cmd ->
+      :counters.add(counter, 1, 1)
+      Interruptus.Command.halt(cmd)
+    end
+
+    halted = Effect.once(command, "halted-effect", fun, config: config.name)
+    assert halted.halted
+
+    # No marker: the effect must re-run on retry instead of being skipped.
+    refute Effect.exists?(command, "halted-effect", config: config.name)
+
+    _ = Effect.once(command, "halted-effect", fun, config: config.name)
+    assert :counters.get(counter, 1) == 2
+  end
+
   test "once does not record marker on suspend", %{config: config, command: command} do
     result =
       Effect.once(

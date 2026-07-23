@@ -2,9 +2,12 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
   @moduledoc """
   Example durable workflow: debit then credit with checkpoint verification.
 
-  Demonstrates `Interruptus.Effect` for at-least-once-safe stage markers.
-  Real money movement should still use domain unique constraints; markers make
-  successful completion skippable on replay and usable from `verify/1`.
+  Demonstrates `Interruptus.Effect` for at-least-once-safe stage markers and
+  per-checkpoint compensations: on rollback, only checkpoints the workflow
+  actually passed are compensated, in LIFO order (credit reversed before
+  debit). Real money movement should still use domain unique constraints;
+  markers make successful completion skippable on replay and usable from
+  `verify/1`.
   """
 
   use Interruptus.Workflow
@@ -17,14 +20,16 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
     data :debit_ref, :string
     data :credit_ref, :string
 
+    stage_timeout 30_000
+
     pipeline :validate_accounts
 
-    checkpoint do
+    checkpoint compensate: :reverse_debit do
       verify :verify_debit_applied
       pipeline :debit_account
     end
 
-    checkpoint do
+    checkpoint compensate: :reverse_credit do
       verify :verify_credit_applied
       pipeline :credit_account
     end
@@ -32,7 +37,6 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
     pipeline :send_receipt
 
     restart_policy max_attempts: 3, backoff: :exponential
-    rollback_policy compensate: [:reverse_debit, :reverse_credit]
   end
 
   def validate_accounts(command, params, _data) do
@@ -85,6 +89,8 @@ defmodule MinimalHostApp.Workflows.TransferFunds do
     end
   end
 
+  # Compensations must be idempotent: the step in flight during a crash runs
+  # again after reclaim (compensation progress is otherwise persisted per step).
   def reverse_debit(command), do: command
   def reverse_credit(command), do: command
 end

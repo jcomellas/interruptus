@@ -43,4 +43,21 @@ defmodule Interruptus.WorkflowTest do
     assert Simple.restart_policy().max_attempts == 2
     assert Simple.rollback_policy().compensate == [:undo]
   end
+
+  test "stage_timeout defaults to :infinity and is configurable" do
+    assert Simple.stage_timeout() == :infinity
+    assert Interruptus.Test.Support.Workflows.TimedOut.stage_timeout() == 100
+  end
+
+  test "checkpoint compensate option is captured in flattened segments" do
+    alias Interruptus.Test.Support.Workflows.CompCrash
+
+    segments = CompCrash.flattened_pipelines()
+
+    assert Enum.map(segments, & &1.compensate) == [:undo_one, :undo_two, nil, :undo_never]
+    assert Enum.all?(segments, &(&1.type == :checkpoint))
+
+    # Plain checkpoints and stages carry compensate: nil.
+    assert Enum.map(Simple.flattened_pipelines(), & &1.compensate) == [nil, nil]
+  end
 end
