@@ -6,8 +6,9 @@ defmodule Interruptus.Command do
   `params`, `data`, `errors`, `halted`, and `success` fields. Use these helpers inside
   pipeline stage functions to update state and control execution flow.
 
-  Stage functions should return the updated command struct, `{:suspend, reason, metadata}`,
-  or call `halt/2` to stop forward progress.
+  Stage functions should return the updated command struct,
+  `{:suspend, reason, metadata}`, `Command.suspend/3` (4-tuple with mutations),
+  `{:error, reason}`, or call `halt/2` to stop forward progress.
   """
 
   @typedoc "Workflow command struct."
@@ -81,10 +82,35 @@ defmodule Interruptus.Command do
   end
 
   @doc """
+  Requests voluntary suspension while preserving command mutations.
+
+  Prefer this over returning `{:suspend, reason, metadata}` when the stage has
+  already updated `params`/`data` that must be persisted on suspend.
+
+  ## Arguments
+
+    * `command` - updated workflow command struct
+    * `reason` - suspend reason (atom or string)
+    * `metadata` - JSON-serializable map (default `%{}`)
+
+  ## Returns
+
+    * `{:suspend, reason, metadata, command}`
+  """
+  @spec suspend(t(), term(), map()) :: {:suspend, term(), map(), t()}
+  def suspend(command, reason, metadata \\ %{}) when is_map(metadata) do
+    {:suspend, reason, metadata, command}
+  end
+
+  @doc """
   Halts pipeline execution for the current segment.
 
-  Sets `halted: true` on the command. The engine treats a halted command as a
-  segment failure and applies the workflow restart policy.
+  Sets `halted: true` on the command.
+
+    * `halt(command)` / `halt(command, success: false)` — treated as a segment
+      failure; the runner applies the restart policy then rollback.
+    * `halt(command, success: true)` — durable early exit; the runner persists
+      `:completed` without compensation.
 
   ## Arguments
 
@@ -92,7 +118,7 @@ defmodule Interruptus.Command do
 
   ## Options
 
-    * `:success` - when `true`, marks `success: true` despite halting (default `false`)
+    * `:success` - when `true`, complete the workflow successfully (default `false`)
 
   ## Returns
 
@@ -217,14 +243,19 @@ defmodule Interruptus.Command do
   ## Returns
 
     * Updated command struct when the stage returns a map
-    * `{:suspend, reason, metadata}` when the stage requests voluntary suspension
+    * `{:suspend, reason, metadata}` or `{:suspend, reason, metadata, command}`
+    * `{:error, reason}` when the stage reports a structured failure
 
   ## Raises
 
     * `UndefinedFunctionError` - when the resolved MFA does not exist
     * `ArgumentError` - when the stage arity does not match
   """
-  @spec apply_fun(t(), any()) :: t() | {:suspend, term(), map()}
+  @spec apply_fun(t(), any()) ::
+          t()
+          | {:suspend, term(), map()}
+          | {:suspend, term(), map(), t()}
+          | {:error, term()}
   def apply_fun(%mod{params: params, data: data} = command, name) when is_atom(name) do
     apply(mod, name, [command, params, data])
   end

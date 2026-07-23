@@ -35,7 +35,7 @@ defmodule Interruptus.WorkflowTest do
   test "verify :failed returns error" do
     Process.put(:verify_result, :failed)
 
-    assert {:error, :verify_failed} = Simple.run(%{value: 3})
+    assert {:error, :verify_failed, _command} = Simple.run(%{value: 3})
   end
 
   test "segments and policies are defined" do

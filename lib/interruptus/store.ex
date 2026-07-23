@@ -311,25 +311,46 @@ defmodule Interruptus.Store do
 
     * `config` - Interruptus config
     * `now` - reference time for lease comparison (default `DateTime.utc_now/0`)
+    * `opts` - pagination options
+
+  ## Options
+
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` cursor for keyset pagination (exclusive)
 
   ## Returns
 
-    * List of `%WorkflowInstance{}`, ordered by `inserted_at`, limited to 100 rows
+    * List of `%WorkflowInstance{}`, ordered by `inserted_at`, `id`
   """
-  @spec list_reclaimable(Config.t(), DateTime.t()) :: [WorkflowInstance.t()]
-  def list_reclaimable(config, now \\ DateTime.utc_now()) do
+  @spec list_reclaimable(Config.t(), DateTime.t(), keyword()) :: [WorkflowInstance.t()]
+  def list_reclaimable(config, now \\ DateTime.utc_now(), opts \\ []) do
     statuses = WorkflowInstance.claimable_statuses()
+    limit = Keyword.get(opts, :limit, 100)
+    after_cursor = Keyword.get(opts, :after)
 
-    Repo.all(
-      config,
+    query =
       from(w in WorkflowInstance,
         where:
           w.status in ^statuses and
             (is_nil(w.locked_until) or w.locked_until < ^now),
-        order_by: [asc: w.inserted_at],
-        limit: 100
+        order_by: [asc: w.inserted_at, asc: w.id],
+        limit: ^limit
       )
-    )
+
+    query =
+      case after_cursor do
+        {inserted_at, id} ->
+          from(w in query,
+            where:
+              w.inserted_at > ^inserted_at or
+                (w.inserted_at == ^inserted_at and w.id > ^id)
+          )
+
+        nil ->
+          query
+      end
+
+    Repo.all(config, query)
   end
 
   @spec build_set_fields(map(), non_neg_integer(), DateTime.t()) :: [{atom(), term()}]

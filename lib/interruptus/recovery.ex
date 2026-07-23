@@ -13,11 +13,10 @@ defmodule Interruptus.Recovery do
   Scan scheduling adds a small random jitter so multiple nodes do not scan in
   lockstep.
 
-  Workflow rows whose `workflow_type` cannot be resolved to a loaded workflow
-  module (e.g. renamed module, or rolling deploy where this node runs older
-  code) are skipped with a warning and a
-  `[:interruptus, :recovery, :unknown_workflow_type]` telemetry event —
-  never mutated — so a node running newer code can still pick them up.
+  Workflow rows whose `workflow_type` cannot be resolved are parked as
+  `:suspended` with reason `"unknown_workflow_type"` so they leave the reclaim
+  set and cannot starve newer reclaimable work. An operator (or a node that
+  loads the module) can resume or cancel them explicitly.
   """
 
   use GenServer
@@ -29,6 +28,10 @@ defmodule Interruptus.Recovery do
   alias Interruptus.WorkflowType
 
   @typep state :: %{config: Config.t()}
+
+  @page_size 100
+  # Bound work per scan so a huge backlog cannot block the GenServer forever.
+  @max_pages 50
 
   # Starts a Recovery GenServer. Options: :config (required), :name.
   @doc false
@@ -65,11 +68,12 @@ defmodule Interruptus.Recovery do
   end
 
   @doc """
-  Recovers all reclaimable workflows for the given config.
+  Recovers reclaimable workflows for the given config.
 
-  Queries `Interruptus.Store.list_reclaimable/1` and starts a runner for each
-  instance. Safe to call concurrently; duplicate runners are prevented by the
-  registry check in `RunnerSupervisor` and by lease claiming.
+  Pages through reclaimable rows with keyset pagination until a page is empty
+  or the per-scan page budget is exhausted. Safe to call concurrently;
+  duplicate runners are prevented by the registry check in `RunnerSupervisor`
+  and by lease claiming.
 
   ## Arguments
 
@@ -81,26 +85,65 @@ defmodule Interruptus.Recovery do
   """
   @spec recover_all(Config.t()) :: :ok
   def recover_all(config) do
-    config
-    |> Store.list_reclaimable()
-    |> Enum.each(fn instance ->
-      case WorkflowType.resolve(instance.workflow_type) do
-        {:ok, workflow_module} ->
-          Interruptus.RunnerSupervisor.start_runner(config, workflow_module, instance.id)
+    now = DateTime.utc_now()
+    recover_pages(config, now, nil, 0)
+    :ok
+  end
 
-        {:error, :unknown_workflow_type} ->
-          Logger.warning(
-            "interruptus recovery skipped workflow_id=#{instance.id} " <>
-              "workflow_type=#{instance.workflow_type}: module not resolvable on this node"
-          )
+  @spec recover_pages(Config.t(), DateTime.t(), {DateTime.t(), Ecto.UUID.t()} | nil, non_neg_integer()) ::
+          :ok
+  defp recover_pages(_config, _now, _cursor, page) when page >= @max_pages, do: :ok
 
-          :telemetry.execute(
-            [:interruptus, :recovery, :unknown_workflow_type],
-            %{},
-            %{workflow_id: instance.id, workflow_type: instance.workflow_type}
-          )
+  defp recover_pages(config, now, cursor, page) do
+    opts =
+      case cursor do
+        nil -> [limit: @page_size]
+        after_cursor -> [limit: @page_size, after: after_cursor]
       end
-    end)
+
+    case Store.list_reclaimable(config, now, opts) do
+      [] ->
+        :ok
+
+      batch ->
+        Enum.each(batch, &recover_instance(config, &1))
+        last = List.last(batch)
+        recover_pages(config, now, {last.inserted_at, last.id}, page + 1)
+    end
+  end
+
+  @spec recover_instance(Config.t(), Interruptus.Schemas.WorkflowInstance.t()) :: :ok
+  defp recover_instance(config, instance) do
+    case WorkflowType.resolve(instance.workflow_type) do
+      {:ok, workflow_module} ->
+        _ = Interruptus.RunnerSupervisor.start_runner(config, workflow_module, instance.id)
+        :ok
+
+      {:error, :unknown_workflow_type} ->
+        park_unknown_workflow_type(config, instance)
+    end
+  end
+
+  @spec park_unknown_workflow_type(Config.t(), Interruptus.Schemas.WorkflowInstance.t()) :: :ok
+  defp park_unknown_workflow_type(config, instance) do
+    Logger.warning(
+      "interruptus recovery parking workflow_id=#{instance.id} " <>
+        "workflow_type=#{instance.workflow_type}: module not resolvable on this node"
+    )
+
+    :telemetry.execute(
+      [:interruptus, :recovery, :unknown_workflow_type],
+      %{},
+      %{workflow_id: instance.id, workflow_type: instance.workflow_type}
+    )
+
+    _ =
+      Store.update_with_lock(config, instance, %{
+        status: :suspended,
+        suspend_reason: "unknown_workflow_type",
+        locked_by: nil,
+        locked_until: nil
+      })
 
     :ok
   end

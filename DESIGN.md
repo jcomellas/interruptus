@@ -120,14 +120,19 @@ Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`
    GenServer keeps heartbeating while the task runs. Exceptions, throws,
    exits, invalid return values, and `stage_timeout` expiry are contained as
    failures and routed through the restart policy.
-3. If the segment has `verify/1`, run it first: `:done` skips the stages,
-   `:not_done` runs them, `:failed` routes to the restart policy.
+3. If the segment has `verify/1`, run it first under the same `stage_timeout`:
+   `:done` skips the stages, `:not_done` runs them, `:failed` routes to the
+   restart policy. Hung verify is a timeout failure.
 4. On checkpoint boundary, persist snapshot + audit row in one fenced
    transaction and reset `attempt_count` to `0`.
-5. On `{:suspend, ...}`, persist state and `:suspended`; release lease; stop.
+5. On suspend, persist state and `:suspended`; release lease; stop. Prefer
+   `Command.suspend/3` when mutations must be kept; the 3-tuple form keeps
+   the pre-stage command.
 6. On failure with remaining budget, back off, reload the row (fenced), and
    rebuild the command from the last checkpoint — the runner already holds
-   the lease and does **not** re-claim.
+   the lease and does **not** re-claim. Engine errors carry the last-good
+   command for same-process rollback.
+7. `halt(success: true)` completes the workflow as `:completed`.
 
 ### Crash Recovery
 
@@ -137,7 +142,11 @@ Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`
 3. New Runner claims (version bump fences the old one), loads the snapshot,
    and resumes from the last checkpoint (or from `compensation_index` for
    `:compensating` rows). Rows whose `workflow_type` cannot be resolved on
-   this node are skipped with a warning + telemetry, never mutated.
+   this node are parked as `:suspended` with reason `"unknown_workflow_type"`
+   (and the lease cleared) so they leave the reclaim set; an operator or a
+   node that loads the module can resume or cancel them. Reclaim scans use
+   keyset pagination so large backlogs are not truncated to a fixed oldest-N
+   window forever.
 
 ### Complete
 
@@ -146,12 +155,20 @@ Terminal success sets `:completed`. Recovery ignores terminal rows.
 ### Rollback
 
 On failure after restart exhaustion, the compensation plan is computed from
-checkpoints the workflow passed (LIFO) plus the workflow-level list. Each
+checkpoints the workflow passed (LIFO) plus the workflow-level list. Entering
+compensation persists the current command snapshot (params/data/errors). Each
 compensation function runs in a supervised task with the same attempt
 accounting; `compensation_index` (and command state) is persisted after each
 completed step. Success ends `:compensated`; exhaustion ends `:failed`
-(resumable to retry compensation). An empty plan ends `:failed` directly —
-nothing was rolled back, so claiming `:compensated` would be misleading.
+(resumable to retry compensation when the plan is non-empty). An empty plan
+ends `:failed` directly — nothing was rolled back, so claiming `:compensated`
+would be misleading. `resume/2` on empty-plan `:failed` returns
+`{:error, :not_compensable}`.
+
+`cancel(id, compensate: true)` fences the row to `:compensating`, clears the
+lease, **evicts** any Registry-registered runner, and starts a fresh runner.
+If that start fails, the row remains reclaimable and Recovery finishes
+compensation.
 
 ## Data Model
 

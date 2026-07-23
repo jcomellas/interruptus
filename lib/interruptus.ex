@@ -138,11 +138,12 @@ defmodule Interruptus do
 
   ## Returns
 
-    * `{:ok, %WorkflowInstance{}}` - new or existing instance row
+    * `{:ok, %WorkflowInstance{}}` - new or existing instance row. Durable even
+      when an immediate runner start fails; Recovery reclaims lease-less
+      `:pending` rows.
     * `{:error, %Ecto.Changeset{}}` - validation or constraint failure on insert
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo (rejected to avoid nested-savepoint races)
-    * `{:error, term()}` - runner could not be started
 
   ## Examples
 
@@ -159,25 +160,45 @@ defmodule Interruptus do
     with :ok <- reject_in_transaction(config),
          {:ok, cast_params} <- workflow_module.cast_params(params),
          {:ok, dumped_params} <- workflow_module.dump_params(cast_params),
-         {:ok, dumped_data} <- workflow_module.dump_data(%{}),
-         {:ok, instance} <-
-           insert_or_existing(config, workflow_type, idempotency_key, %{
-             workflow_type: workflow_type,
-             status: :pending,
-             params: dumped_params,
-             data: dumped_data,
-             current_stage_index: 0,
-             pipeline_version: workflow_module.pipeline_version(),
-             idempotency_key: idempotency_key
-           }),
-         {:ok, _pid} <- RunnerSupervisor.start_runner(config, workflow_module, instance.id) do
-      :telemetry.execute(
-        [:interruptus, :workflow, :started],
-        %{},
-        %{workflow_id: instance.id, workflow_type: instance.workflow_type}
-      )
+         {:ok, dumped_data} <- workflow_module.dump_data(struct(workflow_module).data) do
+      attrs = %{
+        workflow_type: workflow_type,
+        status: :pending,
+        params: dumped_params,
+        data: dumped_data,
+        current_stage_index: 0,
+        pipeline_version: workflow_module.pipeline_version(),
+        idempotency_key: idempotency_key
+      }
 
-      {:ok, instance}
+      case insert_or_existing(config, workflow_type, idempotency_key, attrs) do
+        {:ok, instance} ->
+          case RunnerSupervisor.start_runner(config, workflow_module, instance.id) do
+            {:ok, _pid} ->
+              :telemetry.execute(
+                [:interruptus, :workflow, :started],
+                %{},
+                %{workflow_id: instance.id, workflow_type: instance.workflow_type}
+              )
+
+              {:ok, instance}
+
+            {:error, reason} ->
+              # Row is durable and reclaimable; Recovery will start the runner.
+              emit_runner_start_failed(instance.id, :pending, reason)
+
+              :telemetry.execute(
+                [:interruptus, :workflow, :started],
+                %{},
+                %{workflow_id: instance.id, workflow_type: instance.workflow_type}
+              )
+
+              {:ok, instance}
+          end
+
+        error ->
+          error
+      end
     end
   end
 
@@ -210,6 +231,8 @@ defmodule Interruptus do
     * `{:error, :stale_lock}` - concurrent update; safe to retry
     * `{:error, :unknown_workflow_type}` - `workflow_type` does not resolve to
       a loaded workflow module on this node
+    * `{:error, :not_compensable}` - `:failed` workflow has an empty compensation
+      plan; status stays `:failed`
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo
     * `{:error, term()}` - runner could not be started
@@ -222,7 +245,7 @@ defmodule Interruptus do
          %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
          false <- WorkflowInstance.terminal?(instance),
          {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
-         {:ok, _prepared} <- prepare_resume(config, instance),
+         {:ok, _prepared} <- prepare_resume(config, workflow_module, instance),
          {:ok, pid} <- RunnerSupervisor.start_runner(config, workflow_module, workflow_id) do
       :telemetry.execute(
         [:interruptus, :workflow, :resumed],
@@ -246,9 +269,9 @@ defmodule Interruptus do
   and stops without further side effects on the workflow row.
 
   With `compensate: true` and a non-empty compensation plan, the workflow
-  transitions to `:compensating` instead of `:cancelled`: compensation
-  functions for passed checkpoints run (LIFO) and the workflow ends
-  `:compensated`.
+  transitions to `:compensating` instead of `:cancelled`. Any registered
+  runner is evicted and a fresh compensation runner is started. If that
+  start fails, the row remains reclaimable and Recovery finishes the work.
 
   Retries the fenced write a few times when it races runner writes.
 
@@ -336,9 +359,9 @@ defmodule Interruptus do
     end)
   end
 
-  @spec prepare_resume(Config.t(), WorkflowInstance.t()) ::
-          {:ok, WorkflowInstance.t()} | {:error, :stale_lock}
-  defp prepare_resume(config, %WorkflowInstance{status: :suspended} = instance) do
+  @spec prepare_resume(Config.t(), module(), WorkflowInstance.t()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :stale_lock | :not_compensable}
+  defp prepare_resume(config, _workflow_module, %WorkflowInstance{status: :suspended} = instance) do
     Store.update_with_lock(config, instance, %{
       status: :pending,
       suspend_reason: nil,
@@ -347,16 +370,22 @@ defmodule Interruptus do
     })
   end
 
-  defp prepare_resume(config, %WorkflowInstance{status: :failed} = instance) do
-    Store.update_with_lock(config, instance, %{
-      status: :compensating,
-      attempt_count: 0,
-      locked_by: nil,
-      locked_until: nil
-    })
+  defp prepare_resume(config, workflow_module, %WorkflowInstance{status: :failed} = instance) do
+    case Rollback.compensation_plan(workflow_module, instance.current_stage_index) do
+      [] ->
+        {:error, :not_compensable}
+
+      _plan ->
+        Store.update_with_lock(config, instance, %{
+          status: :compensating,
+          attempt_count: 0,
+          locked_by: nil,
+          locked_until: nil
+        })
+    end
   end
 
-  defp prepare_resume(_config, instance), do: {:ok, instance}
+  defp prepare_resume(_config, _workflow_module, instance), do: {:ok, instance}
 
   @spec do_cancel(Config.t(), Ecto.UUID.t(), boolean(), non_neg_integer()) ::
           {:ok, WorkflowInstance.t()} | {:error, term()}
@@ -427,14 +456,31 @@ defmodule Interruptus do
              }) do
           {:ok, compensating} ->
             emit_cancelled(workflow_id)
-            _ = RunnerSupervisor.start_runner(config, workflow_module, workflow_id)
-            {:ok, compensating}
+
+            case RunnerSupervisor.replace_runner(config, workflow_module, workflow_id) do
+              {:ok, _pid} ->
+                {:ok, compensating}
+
+              {:error, reason} ->
+                emit_runner_start_failed(workflow_id, :compensating, reason)
+                # Row is reclaimable (lease cleared); Recovery will start compensation.
+                {:ok, compensating}
+            end
 
           {:error, :stale_lock} ->
             do_cancel(config, workflow_id, true, retries - 1)
         end
       end
     end
+  end
+
+  @spec emit_runner_start_failed(Ecto.UUID.t(), atom(), term()) :: :ok
+  defp emit_runner_start_failed(workflow_id, status, reason) do
+    :telemetry.execute(
+      [:interruptus, :workflow, :runner_start_failed],
+      %{},
+      %{workflow_id: workflow_id, status: status, reason: reason}
+    )
   end
 
   @spec emit_cancelled(Ecto.UUID.t()) :: :ok

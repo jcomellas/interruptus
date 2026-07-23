@@ -151,7 +151,7 @@ defmodule Interruptus.RecoveryTest do
     assert {:ok, %{status: :suspended}} = Interruptus.status(instance.id, config: config.name)
   end
 
-  test "recover_all skips unresolvable workflow types without mutating them", %{config: config} do
+  test "recover_all parks unresolvable workflow types as suspended", %{config: config} do
     past = DateTime.add(DateTime.utc_now(), -60, :second)
 
     handler_id = "unknown-type-#{System.unique_integer()}"
@@ -185,10 +185,11 @@ defmodule Interruptus.RecoveryTest do
     assert_receive {:unknown_type, %{workflow_type: "No.Such.Workflow.Module"}}, 1_000
     refute Test.runner_pid(instance.id)
 
-    # Row untouched: a node running newer code can still recover it.
     row = Store.get(config, instance.id)
-    assert row.status == :running
-    assert row.lock_version == instance.lock_version
+    assert row.status == :suspended
+    assert row.suspend_reason == "unknown_workflow_type"
+    assert row.locked_by == nil
+    assert row.lock_version == instance.lock_version + 1
   end
 
   test "start_runner returns existing pid when runner already registered", %{config: config} do

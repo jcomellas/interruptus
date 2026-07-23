@@ -102,22 +102,35 @@ end
 - **Retries are bounded across crashes** — `attempt_count` is persisted *before*
   each execution attempt, so a crash-looping workflow ends in rollback after
   `max_attempts`, never in an infinite reclaim loop. Raised exceptions, throws,
-  exits, timeouts, and `halt/2` all flow through the restart policy.
+  exits, timeouts, and `halt/1` all flow through the restart policy.
+  `halt(command, success: true)` is a durable early exit to `:completed`
+  (no compensation).
 - **Suspension is explicit** — a `:suspended` workflow is never auto-resumed by
   recovery. `Interruptus.resume/2` performs a fenced `suspended → pending`
-  transition. A `:failed` workflow resumes into `:compensating` to retry rollback.
+  transition. A `:failed` workflow with a non-empty compensation plan resumes
+  into `:compensating`; an empty plan returns `{:error, :not_compensable}` and
+  stays `:failed`.
 - **Compensation is durable** — `compensation_index` is persisted after each
   compensation function; a crash mid-rollback is reclaimed and resumes from the
-  last completed step. Compensations run only for checkpoints that were passed.
+  last completed step. Compensations run for passed checkpoints (plus any
+  workflow-level `rollback_policy` list). Entering compensation persists the
+  current command snapshot so reclaim sees the same data.
 - **Cancel fences live runners** — `Interruptus.cancel/2` bumps the fencing
-  token; a running runner (even with a valid lease) fails its next write and
-  stops. `cancel(id, compensate: true)` rolls back passed checkpoints instead
-  (ends `:compensated`).
-- **Long stages are safe** — lease heartbeats renew concurrently with stage
-  execution, so a stage longer than `lease_duration` does not lose exclusivity.
+  token; a running runner fails its next write and stops. `cancel(id, compensate: true)`
+  fences the row, **evicts** any registered runner, and starts a fresh
+  compensation runner (Recovery finishes the job if start fails).
+- **Long stages and verify are safe** — lease heartbeats renew concurrently with
+  segment tasks; `stage_timeout` applies to both stages and `verify/1`.
+- **Start is durable first** — if the workflow row commits but the runner cannot
+  start immediately, `start/3` still returns `{:ok, instance}`; Recovery reclaims
+  lease-less `:pending` rows.
 - **Deploy skew is detected** — a persisted `pipeline_version` that differs from
   the compiled workflow parks the instance as `:suspended`
-  (`"pipeline_version_mismatch"`) instead of misexecuting positional indexes.
+  (`"pipeline_version_mismatch"`). Unresolvable `workflow_type` rows are parked
+  as `:suspended` (`"unknown_workflow_type"`) so they cannot starve reclaim.
+- **Suspend with mutations** — prefer `Command.suspend(command, reason, metadata)`
+  (4-tuple) when the stage has already updated `data`/`params`; the 3-tuple
+  `{:suspend, reason, metadata}` keeps the pre-stage command.
 
 ## Durability and the database
 
@@ -125,8 +138,8 @@ Interruptus persists workflow state in the host application's PostgreSQL databas
 
 - Stage DB writes and checkpoint writes are **independent commits** — not one atomic unit.
 - Segments between checkpoints may run **at-least-once** after a crash; use idempotent side effects, domain unique constraints, and checkpoint `verify/1`.
-- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay. Markers are not written for halted or suspended results, and they do not defend against two runners racing in a lease-expiry window — use domain unique constraints for hard once-only guarantees.
-- `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry.
+- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay. Markers are not written for halted or suspended results. A marker insert failure after a successful effect returns `{:error, {:effect_marker_failed, reason}}` so the restart policy applies (do not treat as success). Markers do not defend against two runners racing in a lease-expiry window — use domain unique constraints for hard once-only guarantees.
+- `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry. In-flight external side effects may still complete after a fence until the process exits.
 
 ### Do not nest API calls in transactions
 

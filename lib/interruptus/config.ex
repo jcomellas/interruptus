@@ -166,6 +166,10 @@ defmodule Interruptus.Config do
   end
 
   @spec validate!(t()) :: t()
+  defp validate!(%__MODULE__{repo: nil}) do
+    raise ArgumentError, "Interruptus.Config requires :repo (got nil)"
+  end
+
   defp validate!(%__MODULE__{node_id: nil} = config) do
     %{config | node_id: "#{Node.self()}/#{boot_token()}"}
   end

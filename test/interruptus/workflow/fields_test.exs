@@ -37,7 +37,18 @@ defmodule Interruptus.Workflow.FieldsTest do
 
       assert {:ok, loaded} = TypedFields.load_data(dumped)
       assert loaded.name == "alice"
-      assert loaded.count == nil
+      refute Map.has_key?(loaded, :count)
+    end
+
+    test "absent JSON keys are omitted so defaults can merge" do
+      assert {:ok, loaded} = TypedFields.load_data(%{})
+      assert loaded == %{}
+    end
+
+    test "explicit JSON null loads as nil" do
+      assert {:ok, loaded} = TypedFields.load_data(%{"flag" => nil, "name" => "x"})
+      assert loaded.flag == nil
+      assert loaded.name == "x"
     end
 
     test "dump_data rejects values that fail dump validation" do

@@ -12,6 +12,9 @@ defmodule Interruptus.Effect do
   * A crash after the side effect but before `put/3` still re-runs the
     function — keep `fun` bodies idempotent or rely on domain unique
     constraints.
+  * If `put/3` fails for a reason other than `:already_exists`, `once/4`
+    returns `{:error, {:effect_marker_failed, reason}}` so the stage fails
+    through the restart policy instead of silently succeeding.
   * Prefer `exists?/3` inside checkpoint `verify/1` functions.
 
   The runtime command carries `workflow_id` (set by `Interruptus.Runner`).
@@ -149,7 +152,9 @@ defmodule Interruptus.Effect do
   ## Returns
 
     * Updated command (or original when skipped)
-    * `{:suspend, reason, metadata}` when `fun` suspends
+    * `{:suspend, reason, metadata}` or `{:suspend, reason, metadata, command}` when `fun` suspends
+    * `{:error, {:effect_marker_failed, reason}}` when the marker cannot be persisted
+      after a successful `fun` (restart policy applies; do not treat as success)
   """
   @spec once(struct(), String.t(), (struct() -> term()), keyword()) :: term()
   def once(command, effect_key, fun, opts \\ [])
@@ -158,6 +163,9 @@ defmodule Interruptus.Effect do
       command
     else
       case fun.(command) do
+        {:suspend, _reason, _metadata, _command} = suspended ->
+          suspended
+
         {:suspend, _reason, _metadata} = suspended ->
           suspended
 
@@ -177,10 +185,10 @@ defmodule Interruptus.Effect do
             {:error, reason} ->
               Logger.warning(
                 "interruptus effect marker insert failed effect_key=#{effect_key}: " <>
-                  "#{inspect(reason)}; effect will re-run on replay"
+                  "#{inspect(reason)}"
               )
 
-              result
+              {:error, {:effect_marker_failed, reason}}
           end
       end
     end

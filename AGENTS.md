@@ -95,16 +95,23 @@ a workflow-level list appended after the per-checkpoint compensations.
 ### Stage return values
 
 - Return the command struct for normal progress.
-- `{:suspend, reason, metadata}` — voluntary suspension; no process held until resume.
+- `{:suspend, reason, metadata}` — voluntary suspension with the **pre-stage** command.
+- `Command.suspend(command, reason, metadata)` — suspension that persists mutations
+  already applied to `command` (preferred when updating `data` before awaiting).
 - `halt/1` — stop forward progress; triggers restart or rollback per policy.
+- `halt(command, success: true)` — durable early exit; persists `:completed`.
+- `{:error, reason}` — structured stage failure (also used by `Effect.once/4`
+  when a marker cannot be persisted).
 - Raised exceptions, throws, exits, invalid returns, and `stage_timeout` expiry
-  are contained and routed through the restart policy (no crash loops).
+  (including hung `verify/1`) are contained and routed through the restart policy.
 
 ### Typed fields
 
 - `param :name, :type` and `data :name, :type` declare Ecto-typed fields.
 - Params are cast and validated at `Interruptus.start/3` (required unless `default:` is set).
 - Data is validated on persist (dump-then-cast); unset (`nil`) fields are omitted from JSONB.
+- Absent JSON keys are omitted on load so declared `default:` values survive
+  `Map.merge`; explicit JSON `null` loads as `nil` and overrides defaults.
 - `:decimal` persists as a normalized string; use `Decimal` in stage functions after load/cast.
 - Supports `Ecto.Enum` and custom `Ecto.Type` modules via field options.
 
@@ -133,17 +140,19 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 6. **Initial checkpoint on start** — every workflow persists a snapshot at initiation.
 7. **No nested API transactions** — `start`/`resume`/`cancel`/`Claim.acquire` reject an open transaction on the configured repo.
 8. **Attempts persisted pre-execution** — crash loops are bounded by `max_attempts` and end in rollback (or `:failed` when nothing is compensable).
-9. **Suspension requires explicit resume** — Recovery reclaims `:pending`/`:running`/`:compensating` only; `resume/2` transitions `:suspended → :pending` and `:failed → :compensating` with a fenced write.
-10. **Version-checked claims** — a `pipeline_version` mismatch parks the workflow as `:suspended` (`"pipeline_version_mismatch"`); unresolvable `workflow_type` rows are skipped by recovery, never mutated.
+9. **Suspension requires explicit resume** — Recovery reclaims `:pending`/`:running`/`:compensating` only; `resume/2` transitions `:suspended → :pending` and `:failed → :compensating` (non-empty plan) with a fenced write; empty-plan `:failed` returns `:not_compensable`.
+10. **Version-checked claims** — a `pipeline_version` mismatch parks the workflow as `:suspended` (`"pipeline_version_mismatch"`); unresolvable `workflow_type` rows are parked `:suspended` (`"unknown_workflow_type"`) so they leave the reclaim set.
+11. **Cancel+compensate evicts runners** — after fencing to `:compensating`, `RunnerSupervisor.replace_runner/3` terminates any registered pid before starting compensation.
+12. **Error tuples carry last-good command** — engine failures return `{:error, reason, command}` so compensation sees in-segment mutations; entering compensation persists params/data.
 
 ## Conventions
 
-- Workflow DSL: `param/3`, `data/3`, `pipeline`, `checkpoint` (with `compensate:`), `stage_timeout/1`, `halt/1`, `put_data/3`, `put_error/3`.
+- Workflow DSL: `param/3`, `data/3`, `pipeline`, `checkpoint` (with `compensate:`), `stage_timeout/1`, `halt/1`, `Command.suspend/3`, `put_data/3`, `put_error/3`.
 - Mirror **Oban** embedding: `Interruptus.Migration.up/0`, `Interruptus.Repo` wrapper.
 - Module layout under `lib/interruptus/`.
-- Public API on `Interruptus` module: `start/3`, `resume/2`, `cancel/2` (supports `compensate: true`), `status/2`. Start is idempotent per `idempotency_key`.
-- Per-instance OTP tree started by `{Interruptus, repo: ...}` in the **host** supervisor; process names derive from config `:name`.
-- Shared-DB effects: `Interruptus.Effect` markers + idempotent `verify/1`.
+- Public API on `Interruptus` module: `start/3`, `resume/2`, `cancel/2` (supports `compensate: true`), `status/2`. Start is idempotent per `idempotency_key` and returns `{:ok, instance}` when the row is durable even if runner start fails.
+- Per-instance OTP tree started by `{Interruptus, repo: ...}` in the **host** supervisor; process names derive from config `:name`. `:repo` is required at config validation.
+- Shared-DB effects: `Interruptus.Effect` markers + idempotent `verify/1`; marker insert failure fails the stage.
 - Use `:telemetry` for observability events.
 
 ## Implementation Phases

@@ -38,28 +38,38 @@ defmodule Interruptus.Workflow.Fields do
       type = schema_mod.__schema__(:type, field)
       key = Atom.to_string(field)
 
-      # Map.fetch (not ||) so falsy values like `false` survive the round-trip.
-      value =
-        case Map.fetch(json_map, key) do
-          {:ok, value} -> value
-          :error -> Map.get(json_map, field)
-        end
+      # Absent keys are omitted so Map.merge(defaults, loaded) keeps declared
+      # defaults. Explicit JSON null still loads as nil and overrides defaults.
+      case fetch_json_value(json_map, key, field) do
+        :absent ->
+          {:cont, {:ok, acc}}
 
-      case Ecto.Type.load(type, value) do
-        {:ok, loaded} ->
-          {:cont, {:ok, Map.put(acc, field, loaded)}}
+        {:ok, value} ->
+          case Ecto.Type.load(type, value) do
+            {:ok, loaded} ->
+              {:cont, {:ok, Map.put(acc, field, loaded)}}
 
-        :error ->
-          {:halt,
-           {:error,
-            CastError.exception(
-              field: field,
-              value: value,
-              operation: :load,
-              reason: :invalid_type
-            )}}
+            :error ->
+              {:halt,
+               {:error,
+                CastError.exception(
+                  field: field,
+                  value: value,
+                  operation: :load,
+                  reason: :invalid_type
+                )}}
+          end
       end
     end)
+  end
+
+  @spec fetch_json_value(map(), String.t(), atom()) :: :absent | {:ok, term()}
+  defp fetch_json_value(json_map, key, field) do
+    cond do
+      Map.has_key?(json_map, key) -> {:ok, Map.get(json_map, key)}
+      Map.has_key?(json_map, field) -> {:ok, Map.get(json_map, field)}
+      true -> :absent
+    end
   end
 
   @doc """

@@ -22,7 +22,7 @@ defmodule Interruptus.Migration do
 
   use Ecto.Migration
 
-  @current_version 3
+  @current_version 4
 
   @doc """
   Runs all Interruptus migrations up to the current version.
@@ -83,6 +83,7 @@ defmodule Interruptus.Migration do
     prefix = Keyword.get(opts, :prefix)
 
     cond do
+      constraint_exists?("interruptus_workflows_status_check", prefix) -> 4
       column_exists?("interruptus_workflows", "compensation_index", prefix) -> 3
       table_exists?("interruptus_effects", prefix) -> 2
       table_exists?("interruptus_workflows", prefix) -> 1
@@ -108,6 +109,24 @@ defmodule Interruptus.Migration do
         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
         """,
         [schema, table, column]
+      )
+
+    rows != []
+  rescue
+    _ -> false
+  end
+
+  @spec constraint_exists?(String.t(), String.t() | nil) :: boolean()
+  defp constraint_exists?(constraint_name, prefix) do
+    schema = prefix || "public"
+
+    %{rows: rows} =
+      repo().query!(
+        """
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = $1 AND constraint_name = $2
+        """,
+        [schema, constraint_name]
       )
 
     rows != []
@@ -276,6 +295,54 @@ defmodule Interruptus.Migration do
     alter table(:interruptus_workflows, prefix: prefix) do
       remove_if_exists :compensation_index, :integer
     end
+
+    :ok
+  end
+
+  # Version 4 migration: CHECK constraint on workflow status + non-negative counters.
+  @doc false
+  @spec up4(keyword()) :: :ok
+  def up4(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_workflows
+    ADD CONSTRAINT interruptus_workflows_status_check
+    CHECK (status IN (
+      'pending', 'running', 'suspended', 'completed', 'failed',
+      'compensating', 'compensated', 'cancelled'
+    ))
+    """)
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_workflows
+    ADD CONSTRAINT interruptus_workflows_nonneg_check
+    CHECK (
+      current_stage_index >= 0 AND
+      lock_version >= 0 AND
+      attempt_count >= 0 AND
+      compensation_index >= 0
+    )
+    """)
+
+    :ok
+  end
+
+  # Version 4 rollback: drops CHECK constraints.
+  @doc false
+  @spec down4(keyword()) :: :ok
+  def down4(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_workflows DROP CONSTRAINT IF EXISTS interruptus_workflows_nonneg_check"
+    )
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_workflows DROP CONSTRAINT IF EXISTS interruptus_workflows_status_check"
+    )
 
     :ok
   end

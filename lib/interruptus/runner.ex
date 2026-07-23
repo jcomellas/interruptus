@@ -385,7 +385,14 @@ defmodule Interruptus.Runner do
         suspend_workflow(%{state | command: updated}, reason, metadata)
 
       {:halted, halted} ->
-        handle_failure(%{state | command: halted}, :halted)
+        if Map.get(halted, :success, false) do
+          complete_workflow(%{state | command: halted})
+        else
+          handle_failure(%{state | command: halted}, :halted)
+        end
+
+      {:error, reason, failed_command} ->
+        handle_failure(%{state | command: failed_command}, reason)
 
       {:error, reason} ->
         handle_failure(state, reason)
@@ -567,7 +574,8 @@ defmodule Interruptus.Runner do
 
   @spec start_rollback(state(), term()) :: step()
   defp start_rollback(state, reason) do
-    %{config: config, instance: instance, workflow_module: workflow_module} = state
+    %{config: config, instance: instance, workflow_module: workflow_module, command: command} =
+      state
 
     plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
     errors = Map.put(instance.errors, "failure", format_reason(reason))
@@ -575,27 +583,31 @@ defmodule Interruptus.Runner do
     if plan == [] do
       mark_failed(state, reason)
     else
-      write =
-        Store.update_as_holder(config, instance, config.node_id, %{
-          status: :compensating,
-          attempt_count: 0,
-          errors: errors
+      with {:ok, params} <- workflow_module.dump_params(command.params),
+           {:ok, data} <- workflow_module.dump_data(command.data),
+           {:ok, updated} <-
+             Store.update_as_holder(config, instance, config.node_id, %{
+               status: :compensating,
+               attempt_count: 0,
+               params: params,
+               data: data,
+               errors: errors
+             }) do
+        :telemetry.execute(
+          [:interruptus, :workflow, :compensating],
+          %{},
+          %{workflow_id: instance.id, reason: reason}
+        )
+
+        begin_comp_attempt(%{
+          state
+          | instance: updated,
+            phase: :compensating,
+            comp_plan: plan
         })
-
-      case write do
-        {:ok, updated} ->
-          :telemetry.execute(
-            [:interruptus, :workflow, :compensating],
-            %{},
-            %{workflow_id: instance.id, reason: reason}
-          )
-
-          begin_comp_attempt(%{
-            state
-            | instance: updated,
-              phase: :compensating,
-              comp_plan: plan
-          })
+      else
+        {:error, %CastError{} = error} ->
+          fail_on_cast_error(state, error)
 
         {:error, :stale_lock} ->
           stop_after_fence(state)
@@ -613,20 +625,26 @@ defmodule Interruptus.Runner do
     plan = state.comp_plan || Rollback.compensation_plan(workflow_module, instance.current_stage_index)
     state = %{state | comp_plan: plan}
 
-    if instance.compensation_index >= length(plan) do
-      finish_compensation(state)
-    else
-      policy = workflow_module.restart_policy()
-      attempt = instance.attempt_count + 1
+    cond do
+      plan == [] ->
+        # Nothing was (or can be) rolled back — never invent :compensated.
+        mark_failed(state, :not_compensable)
 
-      if attempt > policy.max_attempts do
-        mark_failed(state, :compensation_exhausted)
-      else
-        case Store.update_as_holder(config, instance, config.node_id, %{attempt_count: attempt}) do
-          {:ok, updated} -> start_comp_task(%{state | instance: updated})
-          {:error, :stale_lock} -> stop_after_fence(state)
+      instance.compensation_index >= length(plan) ->
+        finish_compensation(state)
+
+      true ->
+        policy = workflow_module.restart_policy()
+        attempt = instance.attempt_count + 1
+
+        if attempt > policy.max_attempts do
+          mark_failed(state, :compensation_exhausted)
+        else
+          case Store.update_as_holder(config, instance, config.node_id, %{attempt_count: attempt}) do
+            {:ok, updated} -> start_comp_task(%{state | instance: updated})
+            {:error, :stale_lock} -> stop_after_fence(state)
+          end
         end
-      end
     end
   end
 

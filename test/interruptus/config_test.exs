@@ -22,6 +22,12 @@ defmodule Interruptus.ConfigTest do
     assert config.node_id == "n1"
   end
 
+  test "missing repo raises ArgumentError" do
+    assert_raise ArgumentError, ~r/:repo/, fn ->
+      Config.new(name: ConfigMissingRepo)
+    end
+  end
+
   test "process names derive from the instance name" do
     assert Config.supervisor_name(Interruptus) == Interruptus.Supervisor
     assert Config.registry_name(Interruptus) == Interruptus.Registry

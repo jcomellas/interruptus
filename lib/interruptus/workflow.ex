@@ -51,8 +51,11 @@ defmodule Interruptus.Workflow do
   ## Stage return values
 
     * Return the updated command struct for normal progress
-    * `{:suspend, reason, metadata}` — voluntary suspension until `Interruptus.resume/2`
-    * `Interruptus.Command.halt/2` — stop forward progress; triggers restart or rollback
+    * `{:suspend, reason, metadata}` — voluntary suspension (pre-stage command)
+    * `Interruptus.Command.suspend/3` — suspension that keeps command mutations
+    * `Interruptus.Command.halt/1` — failure; triggers restart or rollback
+    * `Interruptus.Command.halt(command, success: true)` — durable `:completed`
+    * `{:error, reason}` — structured failure (e.g. effect marker insert failed)
 
   ## Verify functions
 
@@ -553,6 +556,7 @@ defmodule Interruptus.Workflow do
               t()
               | {:suspend, term(), map(), t()}
               | {:error, term()}
+              | {:error, term(), t()}
       def run(%__MODULE__{pipelines: pipelines} = command) do
         pipelines
         |> Enum.reduce_while(command, fn segment, acc ->
@@ -560,14 +564,28 @@ defmodule Interruptus.Workflow do
             {:ok, updated} -> {:cont, updated}
             {:halted, halted} -> {:halt, halted}
             {:suspend, _, _, _} = suspended -> {:halt, suspended}
+            {:error, _, _} = err -> {:halt, err}
             {:error, _} = err -> {:halt, err}
           end
         end)
         |> case do
-          {:suspend, _, _, _} = suspended -> suspended
-          {:error, _} = err -> err
-          %{halted: true} = halted -> halted
-          command -> Interruptus.Command.maybe_mark_successful(command)
+          {:suspend, _, _, _} = suspended ->
+            suspended
+
+          {:error, _, _} = err ->
+            err
+
+          {:error, _} = err ->
+            err
+
+          %{halted: true, success: true} = halted ->
+            Interruptus.Command.maybe_mark_successful(%{halted | halted: false})
+
+          %{halted: true} = halted ->
+            halted
+
+          command ->
+            Interruptus.Command.maybe_mark_successful(command)
         end
       end
 

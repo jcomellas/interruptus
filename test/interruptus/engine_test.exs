@@ -38,14 +38,14 @@ defmodule Interruptus.EngineTest do
     command = Simple.new(%{value: 2})
     [_, checkpoint] = Simple.flattened_pipelines()
 
-    assert {:error, :verify_failed} = Engine.run_segment(Simple, checkpoint, command)
+    assert {:error, :verify_failed, ^command} = Engine.run_segment(Simple, checkpoint, command)
   end
 
   test "invalid verify result returns error" do
     command = InvalidVerify.new()
     [checkpoint] = InvalidVerify.flattened_pipelines()
 
-    assert {:error, {:invalid_verify_result, :bogus}} =
+    assert {:error, {:invalid_verify_result, :bogus}, ^command} =
              Engine.run_segment(InvalidVerify, checkpoint, command)
   end
 
@@ -83,7 +83,7 @@ defmodule Interruptus.EngineTest do
     command = Slow.new()
     [stage] = Slow.flattened_pipelines()
 
-    assert {:error, :timeout} = Engine.run_segment(Slow, stage, command, timeout: 50)
+    assert {:error, :timeout, ^command} = Engine.run_segment(Slow, stage, command, timeout: 50)
   end
 
   test "raised exceptions are contained as error tuples" do
@@ -92,14 +92,14 @@ defmodule Interruptus.EngineTest do
     command = Raising.new(%{id: "e1"})
     [_first, boom_segment | _] = Raising.flattened_pipelines()
 
-    assert {:error, {:exception, %RuntimeError{message: message}, stacktrace}} =
+    assert {:error, {:exception, %RuntimeError{message: message}, stacktrace}, ^command} =
              Engine.run_segment(Raising, boom_segment, command)
 
     assert message =~ "boom stage always raises"
     assert is_list(stacktrace)
 
     # Same containment on the timeout execution path.
-    assert {:error, {:exception, %RuntimeError{}, _}} =
+    assert {:error, {:exception, %RuntimeError{}, _}, ^command} =
              Engine.run_segment(Raising, boom_segment, command, timeout: 5_000)
   end
 
@@ -109,9 +109,10 @@ defmodule Interruptus.EngineTest do
     command = BadReturn.new()
     [segment] = BadReturn.flattened_pipelines()
 
-    assert {:error, {:invalid_stage_result, :oops}} = Engine.run_segment(BadReturn, segment, command)
+    assert {:error, {:invalid_stage_result, :oops}, ^command} =
+             Engine.run_segment(BadReturn, segment, command)
 
-    assert {:error, {:invalid_stage_result, :oops}} =
+    assert {:error, {:invalid_stage_result, :oops}, ^command} =
              Engine.run_segment(BadReturn, segment, command, timeout: 5_000)
   end
 end

@@ -72,7 +72,8 @@ end
 On failure after retries are exhausted, only checkpoints the workflow passed
 are compensated, LIFO, with progress persisted per step — a crash mid-rollback
 resumes where it stopped. Saga-style cancellation is available via
-`Interruptus.cancel(workflow.id, compensate: true)`.
+`Interruptus.cancel(workflow.id, compensate: true)` (evicts any live runner
+and starts compensation).
 
 ## Idempotent start
 
