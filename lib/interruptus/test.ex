@@ -15,6 +15,8 @@ defmodule Interruptus.Test do
       assert {:ok, %{status: :completed}} = Interruptus.Test.await_status(id, :completed)
   """
 
+  import ExUnit.Assertions
+
   alias Interruptus.Claim
   alias Interruptus.Config
   alias Interruptus.Schemas.WorkflowInstance
@@ -177,6 +179,76 @@ defmodule Interruptus.Test do
       %Config{} = config -> config
       nil -> Config.fetch()
       name when is_atom(name) -> Config.fetch(name)
+    end
+  end
+
+  @doc """
+  Assigns a `workflow_id` on a command so `Interruptus.Effect` helpers work in tests.
+
+  Durable runners set this automatically; in-memory `Workflow.new/1` / `run/1`
+  leave it `nil`.
+  """
+  @spec assign_workflow_id(struct(), Ecto.UUID.t()) :: struct()
+  def assign_workflow_id(%{} = command, workflow_id) when is_binary(workflow_id) do
+    %{command | workflow_id: workflow_id}
+  end
+
+  @doc """
+  Asserts an applied effect marker exists for the workflow.
+
+  ## Options
+
+    * `:config` - Interruptus config struct or name
+  """
+  @spec assert_effect_applied(Ecto.UUID.t() | struct(), String.t(), keyword()) :: :ok
+  def assert_effect_applied(command_or_id, effect_key, opts \\ []) do
+    unless Interruptus.Effect.exists?(command_or_id, effect_key, opts) do
+      flunk("expected applied effect #{inspect(effect_key)} for #{inspect(command_or_id)}")
+    end
+
+    :ok
+  end
+
+  @doc """
+  Polls until the workflow's `current_stage_index` equals `expected_index`.
+
+  ## Options
+
+    * `:config` - Interruptus config (default `Interruptus.Config.fetch/0`)
+    * `:timeout` - max wait in ms (default `5_000`)
+    * `:interval` - poll interval in ms (default `50`)
+  """
+  @spec await_stage_index(Ecto.UUID.t(), non_neg_integer(), keyword()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :timeout}
+  def await_stage_index(workflow_id, expected_index, opts \\ [])
+      when is_integer(expected_index) and expected_index >= 0 do
+    config = Keyword.get(opts, :config, Config.fetch())
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    interval = Keyword.get(opts, :interval, 50)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    do_await_stage_index(config, workflow_id, expected_index, deadline, interval)
+  end
+
+  @spec do_await_stage_index(
+          Config.t(),
+          Ecto.UUID.t(),
+          non_neg_integer(),
+          integer(),
+          non_neg_integer()
+        ) :: {:ok, WorkflowInstance.t()} | {:error, :timeout}
+  defp do_await_stage_index(config, workflow_id, expected_index, deadline, interval) do
+    case Store.get(config, workflow_id) do
+      %WorkflowInstance{current_stage_index: ^expected_index} = instance ->
+        {:ok, instance}
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(interval)
+          do_await_stage_index(config, workflow_id, expected_index, deadline, interval)
+        end
     end
   end
 

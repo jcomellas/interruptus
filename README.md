@@ -148,10 +148,27 @@ Interruptus persists workflow state in the host application's PostgreSQL databas
 - Segments between checkpoints may run **at-least-once** after a crash; use idempotent side effects, domain unique constraints, and checkpoint `verify/1`.
 - `Interruptus.Effect.once/4` **claims** a `(workflow_id, effect_key)` marker as
   `:pending` before running work, then marks `:applied` on success (or deletes
-  pending on halt/suspend/error). `exists?/3` is true only for `:applied`.
-  Stale pending markers (older than the lease duration) may be reclaimed.
-  Concurrent callers serialize on the unique key; domain unique constraints are
-  still required for hard once-only guarantees against external systems.
+  pending on halt/suspend/error). Prefer `Effect.exists?/3` in `verify/1` and
+  `Effect.once/4` in the stage, with stable keys from `Effect.key/1`:
+
+      def verify_debit(command) do
+        if Effect.exists?(command, Effect.key(["debit", command.params.ref])),
+          do: :done,
+          else: :not_done
+      end
+
+      def debit_account(command, params, _data) do
+        Effect.once(command, Effect.key(["debit", params.ref]), fn cmd ->
+          # apply side effect
+          cmd
+        end)
+      end
+
+  `exists?/3` is true only for `:applied`. Stale pending markers (older than
+  the lease duration) may be reclaimed. Concurrent callers serialize on the
+  unique key; domain unique constraints are still required for hard once-only
+  guarantees against external systems. In tests, use
+  `Interruptus.Test.assign_workflow_id/2` so in-memory commands can touch markers.
 - `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry. In-flight external side effects may still complete after a fence until the process exits.
 
 ### Do not nest API calls in transactions

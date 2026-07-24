@@ -15,14 +15,27 @@ defmodule Interruptus.Effect do
     so a later retry can claim again.
   * A stale `:pending` marker (older than the Interruptus lease duration) may
     be reclaimed by a later `once/4`.
-  * Prefer `exists?/3` inside checkpoint `verify/1` functions (true only for
-    `:applied`).
-  * Domain unique constraints are still required for hard once-only guarantees
-    against external systems.
+  *   Prefer `exists?/3` inside checkpoint `verify/1` functions (true only for
+  `:applied`), and `once/4` in the matching stage:
+
+      def verify_debit(command) do
+        if Effect.exists?(command, Effect.key(["debit", command.params.ref])) do
+          :done
+        else
+          :not_done
+        end
+      end
+
+      def debit_account(command, params, _data) do
+        Effect.once(command, Effect.key(["debit", params.ref]), fn cmd ->
+          # ... apply side effect ...
+          cmd
+        end)
+      end
 
   The runtime command carries `workflow_id` (set by `Interruptus.Runner`).
   In-memory `Workflow.new/1` / `run/1` have `workflow_id: nil` and cannot
-  persist markers.
+  persist markers — use `Interruptus.Test.assign_workflow_id/2` in tests.
 
   ## Options
 
@@ -38,6 +51,26 @@ defmodule Interruptus.Effect do
   alias Interruptus.Config
   alias Interruptus.Repo
   alias Interruptus.Schemas.Effect
+
+  @doc """
+  Builds a stable effect key from parts.
+
+  Parts are joined with `":"`. Atoms and numbers are stringified.
+
+  ## Examples
+
+      iex> Interruptus.Effect.key(["debit", 42])
+      "debit:42"
+
+      iex> Interruptus.Effect.key([:credit, "abc"])
+      "credit:abc"
+  """
+  @spec key([term()]) :: String.t()
+  def key(parts) when is_list(parts) and parts != [] do
+    parts
+    |> Enum.map(&to_string/1)
+    |> Enum.join(":")
+  end
 
   @doc """
   Returns whether an **applied** effect marker already exists.

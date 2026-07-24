@@ -37,6 +37,20 @@ defmodule Interruptus.EffectTest do
              Effect.put(command, "debit", %{}, config: config.name)
   end
 
+  test "key/1 joins parts for stable effect keys" do
+    assert Effect.key(["debit", 42]) == "debit:42"
+    assert Effect.key([:credit, "abc"]) == "credit:abc"
+  end
+
+  test "Test helpers assign workflow_id and assert applied effects",
+       %{config: config, instance: instance} do
+    command = Interruptus.Test.assign_workflow_id(Simple.new(value: 1), instance.id)
+    key = Effect.key(["helper", instance.id])
+
+    assert {:ok, _} = Effect.put(command, key, %{}, config: config.name)
+    assert :ok = Interruptus.Test.assert_effect_applied(command, key, config: config.name)
+  end
+
   test "exists? reflects applied markers only", %{config: config, command: command, instance: instance} do
     refute Effect.exists?(command, "credit", config: config.name)
 
