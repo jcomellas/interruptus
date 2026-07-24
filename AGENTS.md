@@ -146,9 +146,9 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 6. **Initial checkpoint on start** — every workflow persists a snapshot at initiation.
 7. **No nested API transactions** — `start`/`resume`/`cancel`/`Claim.acquire` reject an open transaction on the configured repo.
 8. **Attempts persisted pre-execution** — crash loops are bounded by `max_attempts` and end in rollback (or `:failed` when nothing is compensable).
-9. **Suspension requires explicit resume** — Recovery reclaims `:pending`/`:running`/`:compensating` only; `resume/2` transitions `:suspended → :pending` and `:failed → :compensating` (non-empty plan) with a fenced write; empty-plan `:failed` returns `:not_compensable`.
+9. **Suspension requires explicit resume** — Recovery reclaims `:pending`/`:running`/`:compensating` only; `resume/2` transitions `:suspended → :pending` and `:failed → :compensating` (non-empty plan) with a fenced write; empty-plan `:failed` returns `:not_compensable`. `signal/3` merges a payload into `suspend_metadata["signal"]` then resumes.
 10. **Identity-checked claims** — `pipeline_version` or `pipeline_fingerprint` mismatch parks as `:suspended`; unresolvable `workflow_type` rows are parked `:suspended` (`"unknown_workflow_type"`) so they leave the reclaim set.
-11. **Cancel defaults to compensate** — `cancel/2` uses `compensate: true` by default, always evicts runners, rejects cancel during `:compensating` without `force: true`, and requires `force: true` for plain cancel when the plan is non-empty.
+11. **Cancel defaults to compensate** — `cancel/2` uses `compensate: true` by default, always evicts runners, rejects cancel during `:compensating` without `force: true`, and requires `force: true` for plain cancel when the plan is non-empty. Helpers: `compensate/2`, `abandon/2`, `retry_compensation/2`.
 12. **Error tuples carry last-good command** — engine failures return `{:error, reason, command}` so compensation sees in-segment mutations; entering compensation persists params/data.
 13. **Effect claim-before-apply** — `Effect.once/4` inserts `:pending`, runs work, marks `:applied` (or deletes pending on failure); `exists?/3` is true only for `:applied`.
 
@@ -157,7 +157,7 @@ Verify functions **must be idempotent** and must not create duplicate side effec
 - Workflow DSL: `param/3`, `data/3`, `pipeline`, `checkpoint` (with `compensate:` + required `verify`), `stage_timeout/1`, `halt/1`, `Command.suspend/3`, `put_data/3`, `put_error/3`.
 - Mirror **Oban** embedding: `Interruptus.Migration.up/0`, `Interruptus.Repo` wrapper.
 - Module layout under `lib/interruptus/`.
-- Public API on `Interruptus` module: `start/3`, `resume/2`, `cancel/2` (default compensate, `force:`), `status/2`. Start is idempotent per `idempotency_key` and returns `{:ok, instance}` when the row is durable even if runner start fails.
+- Public API on `Interruptus` module: `start/3`, `resume/2`, `signal/3`, `cancel/2` (default compensate, `force:`), `compensate/2`, `abandon/2`, `retry_compensation/2`, `status/2`, `segment_name/2`, `list_parked/1`, `acknowledge_pipeline/2`, `purge_terminal/1`. Start is idempotent per `idempotency_key` and returns `{:ok, instance}` when the row is durable even if runner start fails.
 - Per-instance OTP tree started by `{Interruptus, repo: ...}` in the **host** supervisor; process names derive from config `:name`. `:repo` is required at config validation.
 - Shared-DB effects: `Interruptus.Effect` pending/applied markers + idempotent `verify/1`; marker failures fail the stage with a 3-tuple error.
 - Use `:telemetry` for observability events.

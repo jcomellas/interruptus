@@ -88,6 +88,28 @@ defmodule Interruptus.IntegrationTest do
              Test.await_status(instance.id, :completed, config: config, timeout: 10_000)
   end
 
+  test "signal/3 delivers payload and resumes a suspended workflow", %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(Suspendable, %{token: "sig-1"}, config: config.name)
+
+    assert {:ok, _} = Test.await_status(instance.id, :suspended, config: config)
+
+    Interruptus.Test.Support.ApprovalState.approve("sig-1")
+
+    assert {:ok, _pid} =
+             Interruptus.signal(instance.id, %{approved_by: "ops"}, config: config.name)
+
+    assert {:ok, running_or_done} =
+             Test.await_status(instance.id, :completed, config: config, timeout: 10_000)
+
+    # Signal metadata is preserved across the resume transition.
+    assert running_or_done.suspend_metadata["signal"] == %{"approved_by" => "ops"}
+    assert running_or_done.suspend_metadata["token"] == "sig-1"
+
+    assert {:error, :not_suspended} =
+             Interruptus.signal(instance.id, %{}, config: config.name)
+  end
+
   test "cancel prevents restart", %{config: config} do
     {:ok, instance} =
       Store.insert_workflow(config, %{

@@ -263,6 +263,78 @@ defmodule Interruptus do
   end
 
   @doc """
+  Delivers a signal payload to a `:suspended` workflow and resumes it.
+
+  Merges `payload` into `suspend_metadata` under the `"signal"` key, then
+  performs the same fenced `:suspended → :pending` transition as `resume/2`
+  (preserving that metadata so callers can read it via `status/2`). Recovery
+  still never auto-resumes `:suspended` workflows.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+    * `payload` - JSON-serializable map (default `%{}`)
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, pid()}` - runner process pid
+    * `{:error, :not_found}` - no row with that id
+    * `{:error, :not_suspended}` - workflow is not `:suspended`
+    * `{:error, :stale_lock}` - concurrent update; safe to retry
+    * `{:error, :unknown_workflow_type}` - module not loaded on this node
+    * `{:error, :in_transaction}` - called inside an open transaction
+  """
+  @spec signal(Ecto.UUID.t()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id) when is_binary(workflow_id) do
+    signal(workflow_id, %{}, [])
+  end
+
+  @spec signal(Ecto.UUID.t(), map() | keyword()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id, opts) when is_binary(workflow_id) and is_list(opts) do
+    signal(workflow_id, %{}, opts)
+  end
+
+  def signal(workflow_id, payload) when is_binary(workflow_id) and is_map(payload) do
+    signal(workflow_id, payload, [])
+  end
+
+  @spec signal(Ecto.UUID.t(), map(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id, payload, opts) when is_map(payload) and is_list(opts) do
+    config = config_from_opts(opts)
+
+    with :ok <- reject_in_transaction(config),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id) || :not_found,
+         :ok <- require_suspended(instance),
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+         metadata <-
+           Map.put(instance.suspend_metadata || %{}, "signal", stringify_keys(payload)),
+         {:ok, _prepared} <-
+           Store.update_with_lock(config, instance, %{
+             status: :pending,
+             suspend_reason: nil,
+             suspend_metadata: metadata,
+             attempt_count: 0
+           }),
+         {:ok, pid} <- RunnerSupervisor.start_runner(config, workflow_module, workflow_id) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :signaled],
+        %{},
+        %{workflow_id: workflow_id}
+      )
+
+      {:ok, pid}
+    else
+      :not_found -> {:error, :not_found}
+      {:error, _} = error -> error
+      error -> error
+    end
+  end
+
+  @doc """
   Cancels a non-terminal workflow.
 
   The cancel write bumps `lock_version` (fencing token), so a live runner —
@@ -536,6 +608,18 @@ defmodule Interruptus do
   @spec require_force(boolean()) :: :ok | {:error, :force_required}
   defp require_force(true), do: :ok
   defp require_force(_), do: {:error, :force_required}
+
+  @spec require_suspended(WorkflowInstance.t()) :: :ok | {:error, :not_suspended}
+  defp require_suspended(%WorkflowInstance{status: :suspended}), do: :ok
+  defp require_suspended(_), do: {:error, :not_suspended}
+
+  @spec stringify_keys(term()) :: term()
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), stringify_keys(v)} end)
+  end
+
+  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  defp stringify_keys(other), do: other
 
   ## Internal ---------------------------------------------------------------
 

@@ -297,6 +297,9 @@ Interruptus.start(MyApp.TransferFunds, %{from_account_id: "a", ...}, opts)
 # Resume: suspended -> pending (forward) or failed -> compensating (rollback retry)
 Interruptus.resume(workflow_id)
 
+# Signal a suspended workflow (payload stored under suspend_metadata["signal"])
+Interruptus.signal(workflow_id, %{approved_by: "ops"})
+
 # Cancel (defaults to compensate: true; evicts live runners)
 Interruptus.cancel(workflow_id)
 Interruptus.compensate(workflow_id)
@@ -320,7 +323,7 @@ Interruptus.status(workflow_id)
 
 ## Open Questions / Future Work
 
-- Signal/callback API for external event delivery (named awaits).
+- Named signal awaits / early-signal buffering.
 - Child workflow composition.
 - SQLite adapter and storage behaviour formalization.
 - Admin operations: `force_restart`, `replay_from_checkpoint`.

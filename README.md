@@ -111,7 +111,9 @@ end
   (no compensation).
 - **Suspension is explicit** — a `:suspended` workflow is never auto-resumed by
   recovery. `Interruptus.resume/2` performs a fenced `suspended → pending`
-  transition. A `:failed` workflow with a non-empty compensation plan resumes
+  transition. `Interruptus.signal/3` merges a payload into
+  `suspend_metadata["signal"]` then resumes the same way (HITL / external
+  callbacks). A `:failed` workflow with a non-empty compensation plan resumes
   into `:compensating`; an empty plan returns `{:error, :not_compensable}` and
   stays `:failed`.
 - **Compensation is durable** — `compensation_index` is persisted after each
