@@ -401,6 +401,60 @@ defmodule Interruptus.Store do
   @spec parked_reasons() :: [String.t()]
   def parked_reasons, do: @parked_reasons
 
+  @terminal_statuses [:completed, :compensated, :cancelled]
+
+  @doc """
+  Deletes terminal workflow rows older than the given cutoff.
+
+  Child checkpoint/attempt/effect rows cascade via FK `on_delete: :delete_all`.
+
+  ## Options
+
+    * `:older_than` - `%DateTime{}` cutoff, or age in milliseconds relative to now
+    * `:statuses` - terminal statuses to purge (default completed/compensated/cancelled)
+    * `:limit` - max rows to delete (default `1000`)
+  """
+  @spec purge_terminal(Config.t(), keyword()) :: non_neg_integer()
+  def purge_terminal(config, opts \\ []) do
+    older_than = purge_cutoff(Keyword.fetch!(opts, :older_than))
+    statuses = Keyword.get(opts, :statuses, @terminal_statuses)
+    limit = Keyword.get(opts, :limit, 1000)
+
+    unless Enum.all?(statuses, &(&1 in @terminal_statuses)) do
+      raise ArgumentError,
+            "purge_terminal statuses must be terminal (got #{inspect(statuses)})"
+    end
+
+    ids =
+      Repo.all(
+        config,
+        from(w in WorkflowInstance,
+          where: w.status in ^statuses and w.updated_at < ^older_than,
+          order_by: [asc: w.updated_at, asc: w.id],
+          select: w.id,
+          limit: ^limit
+        )
+      )
+
+    case ids do
+      [] ->
+        0
+
+      ids ->
+        {count, _} =
+          Repo.delete_all(config, from(w in WorkflowInstance, where: w.id in ^ids))
+
+        count
+    end
+  end
+
+  @spec purge_cutoff(DateTime.t() | pos_integer()) :: DateTime.t()
+  defp purge_cutoff(%DateTime{} = dt), do: dt
+
+  defp purge_cutoff(ms) when is_integer(ms) and ms > 0 do
+    DateTime.add(DateTime.utc_now(), -ms, :millisecond)
+  end
+
   @spec build_set_fields(map(), non_neg_integer(), DateTime.t()) :: [{atom(), term()}]
   defp build_set_fields(attrs, current_version, now) do
     attrs

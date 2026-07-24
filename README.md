@@ -191,6 +191,13 @@ children = [
 
 See [DESIGN.md](DESIGN.md) for architecture details and [AGENTS.md](AGENTS.md) for contributor context.
 
+## Retention
+
+Call `Interruptus.purge_terminal/1` from a host cron/Oban job to delete old
+`:completed` / `:compensated` / `:cancelled` rows (children cascade). To purge
+during Recovery scans, set `retention_ms` and `purge_schedule: true` in config
+(both default off).
+
 ## License
 
 MIT

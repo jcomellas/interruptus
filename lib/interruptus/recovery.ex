@@ -17,6 +17,10 @@ defmodule Interruptus.Recovery do
   `:suspended` with reason `"unknown_workflow_type"` so they leave the reclaim
   set and cannot starve newer reclaimable work. An operator (or a node that
   loads the module) can resume or cancel them explicitly.
+
+  When `purge_schedule: true` and `retention_ms` are configured, each scan also
+  deletes terminal workflows older than the retention window via
+  `Interruptus.purge_terminal/1` (off by default).
   """
 
   use GenServer
@@ -63,6 +67,7 @@ defmodule Interruptus.Recovery do
   @impl true
   def handle_info(:recover, %{config: config} = state) do
     recover_all(config)
+    maybe_purge_terminal(config)
     schedule_recovery(jittered_interval(config))
     {:noreply, state}
   end
@@ -147,6 +152,15 @@ defmodule Interruptus.Recovery do
 
     :ok
   end
+
+  @spec maybe_purge_terminal(Config.t()) :: :ok
+  defp maybe_purge_terminal(%Config{purge_schedule: true, retention_ms: ms} = config)
+       when is_integer(ms) and ms > 0 do
+    _ = Interruptus.purge_terminal(config: config.name, older_than: ms)
+    :ok
+  end
+
+  defp maybe_purge_terminal(_config), do: :ok
 
   @spec schedule_recovery(pos_integer()) :: reference()
   defp schedule_recovery(interval) do

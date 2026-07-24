@@ -24,6 +24,10 @@ defmodule Interruptus.Config do
     * `:recovery_schedule` - whether `Interruptus.Recovery` scans periodically
       (default `true`; tests typically disable it and call
       `Interruptus.Recovery.recover_all/1` manually)
+    * `:retention_ms` - age threshold for optional terminal purge during
+      recovery scans (`nil` disables; default `nil`)
+    * `:purge_schedule` - when `true` and `:retention_ms` is set, Recovery
+      calls `Interruptus.purge_terminal/1` after each reclaim scan (default `false`)
 
   ## Process names
 
@@ -42,7 +46,9 @@ defmodule Interruptus.Config do
           lease_duration: pos_integer(),
           heartbeat_interval: pos_integer(),
           recovery_interval: pos_integer(),
-          recovery_schedule: boolean()
+          recovery_schedule: boolean(),
+          retention_ms: pos_integer() | nil,
+          purge_schedule: boolean()
         }
 
   defstruct name: Interruptus,
@@ -52,7 +58,9 @@ defmodule Interruptus.Config do
             lease_duration: 30_000,
             heartbeat_interval: 10_000,
             recovery_interval: 5_000,
-            recovery_schedule: true
+            recovery_schedule: true,
+            retention_ms: nil,
+            purge_schedule: false
 
   @doc """
   Builds configuration from application env and optional overrides.

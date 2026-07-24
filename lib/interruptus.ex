@@ -497,6 +497,42 @@ defmodule Interruptus do
     end
   end
 
+  @doc """
+  Deletes terminal workflow instances older than a retention cutoff.
+
+  Only `:completed`, `:compensated`, and `:cancelled` rows are eligible.
+  Dependent checkpoints, stage attempts, and effects cascade on delete.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:older_than` - `%DateTime{}` or age in milliseconds (required)
+    * `:statuses` - subset of terminal statuses (default all three)
+    * `:limit` - max rows per call (default `1000`)
+
+  ## Returns
+
+    * `{:ok, count}` - number of workflow rows deleted
+  """
+  @spec purge_terminal(keyword()) :: {:ok, non_neg_integer()}
+  def purge_terminal(opts \\ []) do
+    config = config_from_opts(opts)
+
+    unless Keyword.has_key?(opts, :older_than) do
+      raise ArgumentError, "Interruptus.purge_terminal/1 requires :older_than"
+    end
+
+    count = Store.purge_terminal(config, opts)
+
+    :telemetry.execute(
+      [:interruptus, :workflow, :purged],
+      %{count: count},
+      %{config: config.name}
+    )
+
+    {:ok, count}
+  end
+
   @spec require_force(boolean()) :: :ok | {:error, :force_required}
   defp require_force(true), do: :ok
   defp require_force(_), do: {:error, :force_required}

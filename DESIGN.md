@@ -306,6 +306,9 @@ Interruptus.abandon(workflow_id)
 Interruptus.list_parked()
 Interruptus.acknowledge_pipeline(workflow_id, force: true)
 
+# Purge old terminal rows (or enable retention_ms + purge_schedule on Recovery)
+Interruptus.purge_terminal(older_than: 30 * 24 * 60 * 60 * 1000)
+
 # Query status
 Interruptus.status(workflow_id)
 
@@ -320,6 +323,5 @@ Interruptus.status(workflow_id)
 - Signal/callback API for external event delivery (named awaits).
 - Child workflow composition.
 - SQLite adapter and storage behaviour formalization.
-- Configurable retention/GC for terminal instances.
 - Admin operations: `force_restart`, `replay_from_checkpoint`.
 - Automatic `current_stage_index` remapping across pipeline edits.
