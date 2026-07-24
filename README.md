@@ -2,6 +2,8 @@
 
 Durable workflow pipelines for Elixir with typed params/data, checkpoint-based persistence, multi-node exclusivity, and explicit suspend/resume.
 
+**Read the [user guide](GUIDE.md)** for design tradeoffs, concepts, compilable examples, and internals. See [DESIGN.md](DESIGN.md) for architecture detail.
+
 ## Installation
 
 ```elixir
@@ -191,7 +193,7 @@ children = [
 ]
 ```
 
-See [DESIGN.md](DESIGN.md) for architecture details and [AGENTS.md](AGENTS.md) for contributor context.
+See [GUIDE.md](GUIDE.md) for the full user guide, [DESIGN.md](DESIGN.md) for architecture details, and [AGENTS.md](AGENTS.md) for contributor context.
 
 ## Retention
 
