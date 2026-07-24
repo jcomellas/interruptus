@@ -76,13 +76,16 @@ defmodule MyApp.TransferFunds do
 
     # Per-checkpoint compensations (preferred): LIFO over passed **and
     # in-flight** checkpoints. `verify` is required when `compensate:` is set.
-    # Compensations must be idempotent.
-    checkpoint compensate: :reverse_debit do
+    # Compensations must be idempotent. Bare `pipeline` stages are for pure
+    # validate/transform work; checkpoints bound side effects.
+    # Names default to the verify atom (or first pipeline); override with
+    # `checkpoint :debit do` when needed for telemetry/status.
+    checkpoint :debit, compensate: :reverse_debit do
       verify :verify_debit
       pipeline :debit_account
     end
 
-    checkpoint compensate: :reverse_credit do
+    checkpoint :credit, compensate: :reverse_credit do
       verify :verify_credit
       pipeline :credit_account
     end

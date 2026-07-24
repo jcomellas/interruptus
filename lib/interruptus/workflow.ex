@@ -82,7 +82,13 @@ defmodule Interruptus.Workflow do
 
   @type raw_segment ::
           {:stage, atom()}
-          | {:checkpoint, %{verify: atom() | nil, pipelines: [atom()], compensate: atom() | nil}}
+          | {:checkpoint,
+             %{
+               name: atom() | nil,
+               verify: atom() | nil,
+               pipelines: [atom()],
+               compensate: atom() | nil
+             }}
 
   @doc """
   Imports workflow definition macros into the calling module.
@@ -201,17 +207,20 @@ defmodule Interruptus.Workflow do
   end
 
   @doc """
-  Declares a checkpoint segment with optional verify, compensation, and
+  Declares a checkpoint segment with optional name, verify, compensation, and
   pipeline stages.
 
   Checkpoint boundaries define durability: the runner persists state after each
   checkpoint segment completes. Stages inside a checkpoint run at-least-once
-  between checkpoints.
+  between checkpoints. Bare `pipeline` stages outside checkpoints are for pure
+  validate/transform work and are not durable by themselves.
 
   Use `verify/1` inside the block to skip already-applied work.
 
   ## Options
 
+    * `:name` - explicit segment name for telemetry/status (defaults to the
+      `verify` atom when set, otherwise the first pipeline atom)
     * `:compensate` - function atom invoked during rollback for this checkpoint
       when it has been **passed** (snapshot persisted) **or is in-flight**
       (current `current_stage_index`). Compensations run LIFO, followed by the
@@ -225,23 +234,37 @@ defmodule Interruptus.Workflow do
         pipeline :capture_payment
       end
 
-      checkpoint compensate: :refund_payment do
+      checkpoint :debit, compensate: :refund_payment do
         verify :verify_payment_applied
         pipeline :capture_payment
+      end
+
+      checkpoint name: :credit, compensate: :reverse_credit do
+        verify :verify_credit
+        pipeline :credit_account
       end
   """
   defmacro checkpoint(do: block) do
     build_checkpoint([], block)
   end
 
-  defmacro checkpoint(opts, do: block) do
+  defmacro checkpoint(name, do: block) when is_atom(name) do
+    build_checkpoint([name: name], block)
+  end
+
+  defmacro checkpoint(opts, do: block) when is_list(opts) do
     build_checkpoint(opts, block)
+  end
+
+  defmacro checkpoint(name, opts, do: block) when is_atom(name) and is_list(opts) do
+    build_checkpoint(Keyword.put(opts, :name, name), block)
   end
 
   @spec build_checkpoint(keyword(), Macro.t()) :: Macro.t()
   defp build_checkpoint(opts, block) do
     quote do
       @workflow_current_segment %{
+        name: Keyword.get(unquote(opts), :name),
         verify: nil,
         pipelines: [],
         compensate: Keyword.get(unquote(opts), :compensate)
@@ -371,6 +394,7 @@ defmodule Interruptus.Workflow do
 
     flattened = flatten_segments(segments)
     validate_compensate_requires_verify!(flattened, env)
+    validate_unique_segment_names!(flattened, env)
 
     normalized_rollback = normalize_rollback_policy(rollback_policy)
     pipeline_fingerprint = compute_pipeline_fingerprint(flattened, normalized_rollback)
@@ -784,13 +808,27 @@ defmodule Interruptus.Workflow do
         [
           %{
             type: :checkpoint,
-            name: nil,
+            name: checkpoint_name(segment),
             verify: segment.verify,
             pipelines: segment.pipelines,
             compensate: Map.get(segment, :compensate)
           }
         ]
     end)
+  end
+
+  @spec checkpoint_name(map()) :: atom() | nil
+  defp checkpoint_name(segment) do
+    cond do
+      match?(%{name: name} when is_atom(name) and not is_nil(name), segment) ->
+        segment.name
+
+      is_atom(segment.verify) and not is_nil(segment.verify) ->
+        segment.verify
+
+      true ->
+        List.first(segment.pipelines)
+    end
   end
 
   @spec validate_compensate_requires_verify!([segment()], Macro.Env.t()) :: :ok
@@ -807,6 +845,27 @@ defmodule Interruptus.Workflow do
       _ ->
         :ok
     end)
+  end
+
+  @spec validate_unique_segment_names!([segment()], Macro.Env.t()) :: :ok
+  defp validate_unique_segment_names!(flattened, env) do
+    names =
+      flattened
+      |> Enum.map(& &1.name)
+      |> Enum.reject(&is_nil/1)
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        :ok
+
+      duplicates ->
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description:
+            "duplicate workflow segment names: #{inspect(Enum.uniq(duplicates))} " <>
+              "(use checkpoint :name do ... end to disambiguate)"
+    end
   end
 
   @spec compute_pipeline_fingerprint([segment()], Interruptus.Policy.Rollback.t()) :: String.t()
@@ -957,7 +1016,8 @@ defmodule Interruptus.Workflow.Segment do
   ## Fields
 
     * `:type` - `:stage` for a single pipeline, `:checkpoint` for a durable segment
-    * `:name` - stage name for `:stage` segments, otherwise `nil`
+    * `:name` - stage function atom, or checkpoint name (explicit override, else
+      verify atom, else first pipeline atom)
     * `:verify` - verify function atom for checkpoints, otherwise `nil`
     * `:pipelines` - ordered list of pipeline function atoms to run
     * `:compensate` - compensation function atom for checkpoints, otherwise `nil`

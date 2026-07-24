@@ -74,12 +74,12 @@ defmodule MyApp.TransferFunds do
 
     pipeline :validate_accounts
 
-    checkpoint compensate: :reverse_debit do
+    checkpoint :debit, compensate: :reverse_debit do
       verify :verify_debit_applied/1
       pipeline :debit_account
     end
 
-    checkpoint compensate: :reverse_credit do
+    checkpoint :credit, compensate: :reverse_credit do
       verify :verify_credit_applied/1
       pipeline :credit_account
     end

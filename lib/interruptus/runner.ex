@@ -249,7 +249,7 @@ defmodule Interruptus.Runner do
         :telemetry.execute(
           [:interruptus, :workflow, :claimed],
           %{},
-          %{workflow_id: workflow_id, node_id: config.node_id}
+          telemetry_meta(state, %{node_id: config.node_id})
         )
 
         schedule_heartbeat(config)
@@ -449,7 +449,7 @@ defmodule Interruptus.Runner do
       :telemetry.execute(
         [:interruptus, :workflow, :checkpoint],
         %{stage_index: next_index},
-        %{workflow_id: instance.id}
+        telemetry_meta(%{state | exec_index: next_index}, %{})
       )
 
       # A checkpoint ends the current attempt span: the next segment starts a
@@ -527,7 +527,7 @@ defmodule Interruptus.Runner do
       :telemetry.execute(
         [:interruptus, :workflow, :suspended],
         %{},
-        %{workflow_id: suspended.id, reason: reason}
+        telemetry_meta(state, %{reason: reason})
       )
 
       {:stop, :normal, %{state | instance: suspended}}
@@ -575,7 +575,7 @@ defmodule Interruptus.Runner do
     :telemetry.execute(
       [:interruptus, :workflow, :retry],
       %{attempt: attempt, delay: delay},
-      %{workflow_id: state.instance.id}
+      telemetry_meta(state, %{})
     )
 
     Process.send_after(self(), :retry, delay)
@@ -902,9 +902,36 @@ defmodule Interruptus.Runner do
   @spec segment_label(module(), non_neg_integer()) :: String.t()
   defp segment_label(workflow_module, index) do
     case Enum.at(workflow_module.flattened_pipelines(), index) do
-      %{type: :stage, name: name} -> to_string(name)
+      %{name: name} when not is_nil(name) -> to_string(name)
       %{type: :checkpoint} -> "checkpoint_#{index}"
       nil -> "stage_#{index}"
+    end
+  end
+
+  @spec telemetry_meta(state(), map()) :: map()
+  defp telemetry_meta(state, extra) do
+    Map.merge(
+      %{
+        workflow_id: state.workflow_id || (state.instance && state.instance.id),
+        segment_name: segment_name_at(state),
+        stage_index: state.exec_index
+      },
+      extra
+    )
+  end
+
+  @spec segment_name_at(state()) :: atom() | nil
+  defp segment_name_at(%{segments: segments, exec_index: index}) when is_list(segments) do
+    case Enum.at(segments, index) do
+      %{name: name} -> name
+      _ -> nil
+    end
+  end
+
+  defp segment_name_at(%{workflow_module: workflow_module, exec_index: index}) do
+    case Enum.at(workflow_module.flattened_pipelines(), index) do
+      %{name: name} -> name
+      _ -> nil
     end
   end
 

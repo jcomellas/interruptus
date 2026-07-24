@@ -60,4 +60,55 @@ defmodule Interruptus.WorkflowTest do
     # Plain checkpoints and stages carry compensate: nil.
     assert Enum.map(Simple.flattened_pipelines(), & &1.compensate) == [nil, nil]
   end
+
+  test "checkpoint names default to verify or first pipeline" do
+    [stage, checkpoint] = Simple.flattened_pipelines()
+    assert stage.name == :double
+    assert checkpoint.name == :verify_doubled
+
+    alias Interruptus.Test.Support.Workflows.SpanStages
+
+    names = Enum.map(SpanStages.flattened_pipelines(), & &1.name)
+    assert names == [:stage_a, :stage_b, :stage_c]
+  end
+
+  test "Interruptus.segment_name/2 resolves module indexes" do
+    assert {:ok, :double} = Interruptus.segment_name(Simple, 0)
+    assert {:ok, :verify_doubled} = Interruptus.segment_name(Simple, 1)
+    assert {:ok, nil} = Interruptus.segment_name(Simple, 99)
+  end
+
+  test "explicit checkpoint names are used and appear in the fingerprint" do
+    alias Interruptus.Test.Support.Workflows.NamedCheckpoints
+
+    [stage, checkpoint] = NamedCheckpoints.flattened_pipelines()
+    assert stage.name == :prepare
+    assert checkpoint.name == :debit
+
+    assert is_binary(NamedCheckpoints.pipeline_fingerprint())
+    assert NamedCheckpoints.pipeline_fingerprint() != Simple.pipeline_fingerprint()
+  end
+
+  test "duplicate segment names raise at compile time" do
+    assert_raise CompileError, ~r/duplicate workflow segment names/, fn ->
+      Code.compile_string("""
+      defmodule Interruptus.Test.Support.Workflows.DupNames#{System.unique_integer([:positive])} do
+        use Interruptus.Workflow
+
+        workflow do
+          checkpoint :same do
+            pipeline :a
+          end
+
+          checkpoint :same do
+            pipeline :b
+          end
+        end
+
+        def a(cmd, _, _), do: cmd
+        def b(cmd, _, _), do: cmd
+      end
+      """)
+    end
+  end
 end

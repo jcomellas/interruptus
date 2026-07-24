@@ -343,6 +343,48 @@ defmodule Interruptus do
     end
   end
 
+  @doc """
+  Resolves the segment name at a workflow index, or for a persisted instance.
+
+  Checkpoint names default to the `verify` atom when set, otherwise the first
+  pipeline atom. Pass an explicit `checkpoint :name do` (or `name:`) to override.
+  Bare stages use their pipeline function atom.
+
+  ## Arguments
+
+    * When the first argument is a workflow module, the second is a
+      non-negative segment index.
+    * When the first argument is a workflow UUID, options may include `:config`.
+
+  ## Returns
+
+    * `{:ok, atom()}` - segment name
+    * `{:ok, nil}` - index past the end of the pipeline (or empty name)
+    * `{:error, :not_found}` - unknown workflow id
+    * `{:error, :unknown_workflow_type}` - module not loaded on this node
+  """
+  @spec segment_name(module() | Ecto.UUID.t(), non_neg_integer() | keyword()) ::
+          {:ok, atom() | nil} | {:error, term()}
+  def segment_name(workflow_module, index)
+      when is_atom(workflow_module) and is_integer(index) and index >= 0 do
+    case Enum.at(workflow_module.flattened_pipelines(), index) do
+      %{name: name} -> {:ok, name}
+      nil -> {:ok, nil}
+    end
+  end
+
+  def segment_name(workflow_id, opts) when is_binary(workflow_id) and is_list(opts) do
+    with {:ok, instance} <- status(workflow_id, opts),
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type) do
+      segment_name(workflow_module, instance.current_stage_index)
+    end
+  end
+
+  @spec segment_name(Ecto.UUID.t()) :: {:ok, atom() | nil} | {:error, term()}
+  def segment_name(workflow_id) when is_binary(workflow_id) do
+    segment_name(workflow_id, [])
+  end
+
   ## Internal ---------------------------------------------------------------
 
   @spec insert_or_existing(Config.t(), String.t(), String.t() | nil, map()) ::
