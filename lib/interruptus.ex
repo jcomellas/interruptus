@@ -428,6 +428,79 @@ defmodule Interruptus do
     segment_name(workflow_id, [])
   end
 
+  @doc """
+  Lists workflows parked for pipeline identity or unknown-type reasons.
+
+  Returns `:suspended` rows whose `suspend_reason` is one of
+  `pipeline_fingerprint_mismatch`, `pipeline_version_mismatch`, or
+  `unknown_workflow_type`.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` keyset cursor
+    * `:reasons` - override the default reason list
+  """
+  @spec list_parked(keyword()) :: [WorkflowInstance.t()]
+  def list_parked(opts \\ []) do
+    config = config_from_opts(opts)
+    store_opts = Keyword.take(opts, [:limit, :after, :reasons])
+    Store.list_parked(config, store_opts)
+  end
+
+  @doc """
+  Accepts the currently compiled pipeline identity for a parked workflow.
+
+  Updates stored `pipeline_version` and `pipeline_fingerprint` to match the
+  loaded workflow module. Does **not** resume the workflow — call `resume/2`
+  afterwards when the layout is compatible.
+
+  **Warning:** acknowledging a breaking layout change can execute the wrong
+  stages against positional indexes. Prefer cancel/compensate when unsure.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:force` - required `true` to perform the update
+  """
+  @spec acknowledge_pipeline(Ecto.UUID.t(), keyword()) ::
+          {:ok, WorkflowInstance.t()} | {:error, term()}
+  def acknowledge_pipeline(workflow_id, opts \\ []) do
+    config = config_from_opts(opts)
+    force? = Keyword.get(opts, :force, false)
+
+    with :ok <- reject_in_transaction(config),
+         :ok <- require_force(force?),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id) || :not_found,
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+         {:ok, updated} <-
+           Store.update_with_lock(config, instance, %{
+             pipeline_version: workflow_module.pipeline_version(),
+             pipeline_fingerprint: workflow_module.pipeline_fingerprint()
+           }) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :pipeline_acknowledged],
+        %{},
+        %{
+          workflow_id: workflow_id,
+          pipeline_version: updated.pipeline_version,
+          pipeline_fingerprint: updated.pipeline_fingerprint
+        }
+      )
+
+      {:ok, updated}
+    else
+      :not_found -> {:error, :not_found}
+      {:error, _} = error -> error
+      error -> error
+    end
+  end
+
+  @spec require_force(boolean()) :: :ok | {:error, :force_required}
+  defp require_force(true), do: :ok
+  defp require_force(_), do: {:error, :force_required}
+
   ## Internal ---------------------------------------------------------------
 
   @spec insert_or_existing(Config.t(), String.t(), String.t() | nil, map()) ::

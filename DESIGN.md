@@ -274,10 +274,19 @@ hash of flattened segments + workflow-level compensations) are stored on the
 instance and enforced at claim time. A mismatch parks the workflow as
 `:suspended` with reason `"pipeline_version_mismatch"` or
 `"pipeline_fingerprint_mismatch"` instead of silently executing positional
-stage indexes against a different pipeline. Operators resolve by deploying
-compatible code and resuming, or cancelling with compensation / force.
-Recovery also parks instances whose `workflow_type` does not resolve on the
-scanning node.
+stage indexes against a different pipeline. Recovery also parks instances
+whose `workflow_type` does not resolve on the scanning node.
+
+**Operator runbook**
+
+1. `Interruptus.list_parked/1` — inventory parked identity mismatches.
+2. Decide: cancel/compensate (`Interruptus.compensate/2` or `abandon/2`), or
+   accept the new compiled identity after a compatible deploy.
+3. `Interruptus.acknowledge_pipeline(id, force: true)` — fenced update of
+   stored version/fingerprint to the compiled module. Does **not** resume.
+   Acknowledging a **breaking** layout change can run the wrong stages —
+   prefer compensate when unsure.
+4. `Interruptus.resume/2` — continue forward execution when safe.
 
 ## API Surface
 
@@ -290,9 +299,12 @@ Interruptus.resume(workflow_id)
 
 # Cancel (defaults to compensate: true; evicts live runners)
 Interruptus.cancel(workflow_id)
+Interruptus.compensate(workflow_id)
+Interruptus.abandon(workflow_id)
 
-# Abandon compensation (operator accepts inconsistent external state)
-Interruptus.cancel(workflow_id, compensate: false, force: true)
+# Parked deploy skew
+Interruptus.list_parked()
+Interruptus.acknowledge_pipeline(workflow_id, force: true)
 
 # Query status
 Interruptus.status(workflow_id)
@@ -305,9 +317,9 @@ Interruptus.status(workflow_id)
 
 ## Open Questions / Future Work
 
-- Workflow migration tooling when `pipeline_version` changes.
-- Signal/callback API for external event delivery.
+- Signal/callback API for external event delivery (named awaits).
 - Child workflow composition.
 - SQLite adapter and storage behaviour formalization.
 - Configurable retention/GC for terminal instances.
 - Admin operations: `force_restart`, `replay_from_checkpoint`.
+- Automatic `current_stage_index` remapping across pipeline edits.

@@ -177,4 +177,42 @@ defmodule Interruptus.IntegrationTest do
     assert parked.suspend_metadata["stored"] == "deadbeef"
     assert parked.suspend_metadata["compiled"] == Simple.pipeline_fingerprint()
   end
+
+  test "list_parked and acknowledge_pipeline unblock a fingerprint mismatch",
+       %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Simple",
+        status: :pending,
+        params: %{"value" => 3},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1,
+        pipeline_fingerprint: "deadbeef"
+      })
+
+    assert {:ok, _pid} =
+             Interruptus.RunnerSupervisor.start_runner(config, Simple, instance.id)
+
+    assert {:ok, parked} =
+             Test.await_status(instance.id, :suspended, config: config, timeout: 5_000)
+
+    assert Enum.any?(Interruptus.list_parked(config: config.name), &(&1.id == parked.id))
+
+    assert {:error, :force_required} =
+             Interruptus.acknowledge_pipeline(parked.id, config: config.name)
+
+    assert {:ok, acked} =
+             Interruptus.acknowledge_pipeline(parked.id, config: config.name, force: true)
+
+    assert acked.pipeline_fingerprint == Simple.pipeline_fingerprint()
+    assert acked.pipeline_version == Simple.pipeline_version()
+    assert acked.status == :suspended
+
+    Process.put(:verify_result, :not_done)
+    assert {:ok, _pid} = Interruptus.resume(parked.id, config: config.name)
+
+    assert {:ok, %{status: :completed, data: %{"result" => 6}}} =
+             Test.await_status(parked.id, :completed, config: config, timeout: 10_000)
+  end
 end

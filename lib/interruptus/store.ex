@@ -353,6 +353,54 @@ defmodule Interruptus.Store do
     Repo.all(config, query)
   end
 
+  @parked_reasons ~w(
+    pipeline_fingerprint_mismatch
+    pipeline_version_mismatch
+    unknown_workflow_type
+  )
+
+  @doc """
+  Lists `:suspended` workflows parked for deploy/identity reasons.
+
+  ## Options
+
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` cursor for keyset pagination (exclusive)
+    * `:reasons` - suspend reasons to include (default identity-mismatch set)
+  """
+  @spec list_parked(Config.t(), keyword()) :: [WorkflowInstance.t()]
+  def list_parked(config, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 100)
+    after_cursor = Keyword.get(opts, :after)
+    reasons = Keyword.get(opts, :reasons, @parked_reasons)
+
+    query =
+      from(w in WorkflowInstance,
+        where: w.status == :suspended and w.suspend_reason in ^reasons,
+        order_by: [asc: w.inserted_at, asc: w.id],
+        limit: ^limit
+      )
+
+    query =
+      case after_cursor do
+        {inserted_at, id} ->
+          from(w in query,
+            where:
+              w.inserted_at > ^inserted_at or
+                (w.inserted_at == ^inserted_at and w.id > ^id)
+          )
+
+        nil ->
+          query
+      end
+
+    Repo.all(config, query)
+  end
+
+  @doc false
+  @spec parked_reasons() :: [String.t()]
+  def parked_reasons, do: @parked_reasons
+
   @spec build_set_fields(map(), non_neg_integer(), DateTime.t()) :: [{atom(), term()}]
   defp build_set_fields(attrs, current_version, now) do
     attrs
