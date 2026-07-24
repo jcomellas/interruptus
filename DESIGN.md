@@ -114,15 +114,17 @@ Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`
    reason `"pipeline_version_mismatch"` or `"pipeline_fingerprint_mismatch"`
    instead of executing positional indexes against a different pipeline layout.
 
-### Run Segment
+### Run Span
 
 1. Persist `attempt_count + 1` (fenced, holder-guarded). An exhausted budget
    goes straight to rollback.
-2. Execute the segment in a supervised task (`Task.Supervisor`); the runner
-   GenServer keeps heartbeating while the task runs. Exceptions, throws,
-   exits, invalid return values, and `stage_timeout` expiry are contained as
-   failures and routed through the restart policy.
-3. If the segment has `verify/1`, run it first under the same `stage_timeout`:
+2. Execute from `current_stage_index` through the next checkpoint (or pipeline
+   end) in one supervised task (`Task.Supervisor`). Bare `:stage` segments
+   between checkpoints run in-memory only. The runner GenServer keeps
+   heartbeating while the task runs. Exceptions, throws, exits, invalid
+   return values, and `stage_timeout` expiry are contained as failures and
+   routed through the restart policy.
+3. If a segment has `verify/1`, run it first under the same `stage_timeout`:
    `:done` skips the stages, `:not_done` runs them, `:failed` routes to the
    restart policy. Hung verify is a timeout failure.
 4. On checkpoint boundary, persist snapshot + audit row in one fenced

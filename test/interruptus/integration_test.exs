@@ -7,6 +7,7 @@ defmodule Interruptus.IntegrationTest do
   alias Interruptus.Store
   alias Interruptus.Test
   alias Interruptus.Test.Support.Workflows.Simple
+  alias Interruptus.Test.Support.Workflows.SpanStages
   alias Interruptus.Test.Support.Workflows.Suspendable
   alias Interruptus.Test.Support.Workflows.DumpFail
 
@@ -22,6 +23,17 @@ defmodule Interruptus.IntegrationTest do
 
     assert {:ok, %{status: :completed, data: %{"result" => 8}}} =
              Test.await_status(instance.id, :completed, config: config)
+  end
+
+  test "multi bare-stage span reaches checkpoint and completes", %{config: config} do
+    assert {:ok, instance} = Interruptus.start(SpanStages, %{value: 5}, config: config.name)
+
+    assert {:ok, %{status: :completed, data: data}} =
+             Test.await_status(instance.id, :completed, config: config)
+
+    assert data["a"] == 5
+    assert data["b"] == 6
+    assert data["c"] == 7
   end
 
   test "start rejects invalid params", %{config: config} do

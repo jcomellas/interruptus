@@ -115,4 +115,29 @@ defmodule Interruptus.EngineTest do
     assert {:error, {:invalid_stage_result, :oops}, ^command} =
              Engine.run_segment(BadReturn, segment, command, timeout: 5_000)
   end
+
+  test "run_span/5 runs bare stages through the next checkpoint" do
+    alias Interruptus.Test.Support.Workflows.SpanStages
+
+    command = SpanStages.new(%{value: 10})
+    segments = SpanStages.flattened_pipelines()
+
+    assert {:ok, updated, 2} = Engine.run_span(SpanStages, segments, 0, command)
+    assert updated.data.a == 10
+    assert updated.data.b == 11
+    assert updated.data.c == 12
+
+    # Starting at the checkpoint alone still returns that index.
+    assert {:ok, _cmd, 2} = Engine.run_span(SpanStages, segments, 2, updated)
+  end
+
+  test "run_span/5 stops at suspend inside a span" do
+    command = Suspendable.new(%{token: "t1"})
+    segments = Suspendable.flattened_pipelines()
+
+    assert {:suspend, :await_approval, %{token: "t1"}, updated, 1} =
+             Engine.run_span(Suspendable, segments, 0, command)
+
+    assert updated.data.step == 1
+  end
 end

@@ -33,9 +33,11 @@ Database (embedded via Interruptus.Migration)
 2. Runner claims the row (`FOR UPDATE SKIP LOCKED`; bumps `lock_version`).
    A runner that cannot claim stops immediately. A `pipeline_version` or
    `pipeline_fingerprint` mismatch parks the row as `:suspended`.
-3. Runner persists `attempt_count + 1` (fenced), then executes the segment in
-   a `Task.Supervisor` task: verify → stages → checkpoint → advance. Heartbeats
-   renew the lease concurrently with execution. Checkpoints reset the budget.
+3. Runner persists `attempt_count + 1` (fenced), then executes from the current
+   index through the next checkpoint (or pipeline end) in one
+   `Task.Supervisor` task: bare stages stay in-memory; verify → stages →
+   checkpoint → advance. Heartbeats renew the lease concurrently with
+   execution. Checkpoints reset the budget.
 4. On suspend: persist snapshot, set `:suspended`, release lease, stop process.
 5. On crash: lease expires; `Interruptus.Recovery` reclaims (`:pending`,
    `:running`, `:compensating` — never `:suspended`) and starts a new Runner.

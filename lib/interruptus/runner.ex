@@ -10,8 +10,10 @@ defmodule Interruptus.Runner do
   2. **Attempt accounting** — persist `attempt_count + 1` **before** executing,
      so crash loops are bounded across process deaths; the budget resets to 0
      at every successful checkpoint
-  3. **Execute** — run the current segment in a `Task.Supervisor` task so this
-     GenServer keeps processing heartbeats while stages run
+  3. **Execute** — run from the current index through the next checkpoint (or
+     pipeline end) in one `Task.Supervisor` task so this GenServer keeps
+     processing heartbeats while stages run. Bare `:stage` segments between
+     checkpoints stay in-memory only until the durability boundary.
   4. **Checkpoint** — persist state after each checkpoint segment with a
      holder-guarded fenced write
   5. **Heartbeat** — renew the lease on interval, concurrently with execution
@@ -57,6 +59,7 @@ defmodule Interruptus.Runner do
            instance: WorkflowInstance.t() | nil,
            command: struct() | nil,
            exec_index: non_neg_integer(),
+           segments: [Interruptus.Workflow.Segment.t()] | nil,
            phase: phase(),
            task: Task.t() | nil,
            comp_plan: [atom()] | nil
@@ -113,6 +116,7 @@ defmodule Interruptus.Runner do
            instance: nil,
            command: nil,
            exec_index: 0,
+           segments: nil,
            phase: :starting,
            task: nil,
            comp_plan: nil
@@ -278,9 +282,16 @@ defmodule Interruptus.Runner do
 
   @spec start_from_claim(state()) :: step()
   defp start_from_claim(%{instance: instance, workflow_module: workflow_module} = state) do
+    segments = workflow_module.flattened_pipelines()
+
     case build_command(workflow_module, instance) do
       {:ok, command} ->
-        state = %{state | command: command, exec_index: instance.current_stage_index}
+        state = %{
+          state
+          | command: command,
+            exec_index: instance.current_stage_index,
+            segments: segments
+        }
 
         case instance.status do
           :compensating ->
@@ -330,14 +341,17 @@ defmodule Interruptus.Runner do
 
   ## Forward execution ------------------------------------------------------
 
-  # Persists the attempt (durable, pre-execution) and starts the segment task.
-  # When the persisted budget is already exhausted (e.g. repeated crashes),
-  # goes straight to rollback.
+  # Persists the attempt (durable, pre-execution) and starts a span task that
+  # runs bare stages through the next checkpoint (or pipeline end). When the
+  # persisted budget is already exhausted (e.g. repeated crashes), goes straight
+  # to rollback.
   @spec begin_attempt(state()) :: step()
   defp begin_attempt(state) do
     %{config: config, instance: instance, workflow_module: workflow_module} = state
+    segments = state.segments || workflow_module.flattened_pipelines()
+    state = %{state | segments: segments}
 
-    if state.exec_index >= length(workflow_module.flattened_pipelines()) do
+    if state.exec_index >= length(segments) do
       complete_workflow(state)
     else
       policy = workflow_module.restart_policy()
@@ -347,28 +361,27 @@ defmodule Interruptus.Runner do
         start_rollback(state, :attempts_exhausted)
       else
         case Store.update_as_holder(config, instance, config.node_id, %{attempt_count: attempt}) do
-          {:ok, updated} -> start_segment(%{state | instance: updated})
+          {:ok, updated} -> start_span(%{state | instance: updated})
           {:error, :stale_lock} -> stop_after_fence(state)
         end
       end
     end
   end
 
-  @spec start_segment(state()) :: step()
-  defp start_segment(state) do
-    %{config: config, workflow_module: workflow_module, command: command} = state
-
-    segments = workflow_module.flattened_pipelines()
+  @spec start_span(state()) :: step()
+  defp start_span(state) do
+    %{config: config, workflow_module: workflow_module, command: command, segments: segments} =
+      state
 
     if state.exec_index >= length(segments) do
       complete_workflow(state)
     else
-      segment = Enum.at(segments, state.exec_index)
       timeout = workflow_module.stage_timeout()
+      from_index = state.exec_index
 
       task =
         Task.Supervisor.async_nolink(Config.task_supervisor_name(config), fn ->
-          Engine.run_segment(workflow_module, segment, command, timeout: timeout)
+          Engine.run_span(workflow_module, segments, from_index, command, timeout: timeout)
         end)
 
       {:noreply, %{state | task: task}}
@@ -377,27 +390,35 @@ defmodule Interruptus.Runner do
 
   @spec handle_segment_result(state(), term()) :: step()
   defp handle_segment_result(state, result) do
-    %{workflow_module: workflow_module} = state
-    segment = Enum.at(workflow_module.flattened_pipelines(), state.exec_index)
+    %{segments: segments} = state
 
     case result do
-      {:ok, updated} ->
-        state = %{state | command: updated}
+      {:ok, updated, end_index} ->
+        state = %{state | command: updated, exec_index: end_index}
+        segment = Enum.at(segments, end_index)
 
-        if segment.type == :checkpoint do
-          checkpoint_and_continue(state)
-        else
-          start_segment(%{state | exec_index: state.exec_index + 1})
+        cond do
+          is_nil(segment) ->
+            complete_workflow(state)
+
+          segment.type == :checkpoint ->
+            checkpoint_and_continue(state)
+
+          true ->
+            # Span ended on the final bare stage(s); no further durability boundary.
+            complete_workflow(%{state | exec_index: end_index + 1})
         end
 
-      {:suspend, reason, metadata, updated} ->
-        suspend_workflow(%{state | command: updated}, reason, metadata)
+      {:suspend, reason, metadata, updated, end_index} ->
+        suspend_workflow(%{state | command: updated, exec_index: end_index}, reason, metadata)
 
-      {:halted, halted} ->
+      {:halted, halted, end_index} ->
+        state = %{state | command: halted, exec_index: end_index}
+
         if Map.get(halted, :success, false) do
-          complete_workflow(%{state | command: halted})
+          complete_workflow(state)
         else
-          handle_failure(%{state | command: halted}, :halted)
+          handle_failure(state, :halted)
         end
 
       {:error, reason, failed_command} ->
@@ -451,6 +472,8 @@ defmodule Interruptus.Runner do
     %{config: config, instance: instance, workflow_module: workflow_module, command: command} =
       state
 
+    segments = state.segments || workflow_module.flattened_pipelines()
+
     with {:ok, params} <- workflow_module.dump_params(command.params),
          {:ok, data} <- workflow_module.dump_data(command.data),
          {:ok, completed} <-
@@ -458,7 +481,7 @@ defmodule Interruptus.Runner do
              status: :completed,
              params: params,
              data: data,
-             current_stage_index: workflow_module.flattened_pipelines() |> length(),
+             current_stage_index: length(segments),
              locked_by: nil,
              locked_until: nil,
              errors: command.errors

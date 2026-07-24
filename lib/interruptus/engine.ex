@@ -63,6 +63,34 @@ defmodule Interruptus.Engine do
   end
 
   @doc """
+  Runs consecutive segments from `from_index` until the next durability boundary.
+
+  Bare `:stage` segments run in-process without returning to the caller. The
+  span stops after a successful `:checkpoint` segment, on suspend/halt/error,
+  or when the pipeline ends (last segment was a bare stage).
+
+  Used by `Interruptus.Runner` so one supervised task covers an entire attempt
+  span (pure stages plus the following checkpoint).
+
+  ## Returns
+
+    * `{:ok, command, end_index}` — completed through `end_index` (checkpoint
+      or final bare stage); caller persists or completes
+    * `{:suspend, reason, metadata, command, end_index}` — suspended at index
+    * `{:halted, command, end_index}` — halted at index
+    * `{:error, reason, command}` — failure (last-good command)
+  """
+  @spec run_span(module(), [segment()], non_neg_integer(), Command.t(), keyword()) ::
+          {:ok, Command.t(), non_neg_integer()}
+          | {:suspend, term(), map(), Command.t(), non_neg_integer()}
+          | {:halted, Command.t(), non_neg_integer()}
+          | {:error, term(), Command.t()}
+  def run_span(workflow_module, segments, from_index, command, opts \\ [])
+      when is_list(segments) and is_integer(from_index) and from_index >= 0 do
+    do_run_span(workflow_module, segments, from_index, command, opts)
+  end
+
+  @doc """
   Runs all segments from the given index until completion, suspend, halt, or error.
   """
   @spec run_from(module(), Command.t(), non_neg_integer(), keyword()) ::
@@ -73,6 +101,45 @@ defmodule Interruptus.Engine do
   def run_from(workflow_module, command, from_index, opts \\ []) do
     segments = workflow_module.flattened_pipelines()
     do_run_from(workflow_module, command, segments, from_index, opts)
+  end
+
+  @spec do_run_span(module(), [segment()], non_neg_integer(), Command.t(), keyword()) ::
+          {:ok, Command.t(), non_neg_integer()}
+          | {:suspend, term(), map(), Command.t(), non_neg_integer()}
+          | {:halted, Command.t(), non_neg_integer()}
+          | {:error, term(), Command.t()}
+  defp do_run_span(_workflow_module, segments, index, command, _opts)
+       when index >= length(segments) do
+    # Caller should not start a span past the end; treat as empty success at
+    # the last valid index so the runner can complete.
+    {:ok, Command.maybe_mark_successful(command), max(index - 1, 0)}
+  end
+
+  defp do_run_span(workflow_module, segments, index, command, opts) do
+    segment = Enum.at(segments, index)
+
+    case run_segment(workflow_module, segment, command, opts) do
+      {:ok, updated} ->
+        cond do
+          segment.type == :checkpoint ->
+            {:ok, updated, index}
+
+          index + 1 >= length(segments) ->
+            {:ok, updated, index}
+
+          true ->
+            do_run_span(workflow_module, segments, index + 1, updated, opts)
+        end
+
+      {:suspend, reason, metadata, updated} ->
+        {:suspend, reason, metadata, updated, index}
+
+      {:halted, halted} ->
+        {:halted, halted, index}
+
+      {:error, reason, failed_command} ->
+        {:error, reason, failed_command}
+    end
   end
 
   @spec do_run_from(module(), Command.t(), [segment()], non_neg_integer(), keyword()) ::
