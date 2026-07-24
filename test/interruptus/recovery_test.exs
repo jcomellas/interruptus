@@ -120,11 +120,76 @@ defmodule Interruptus.RecoveryTest do
     assert {:ok, pid_a} = Task.await(resume_task)
     assert :ok = Task.await(recover_task)
 
-    pid_b = Test.runner_pid(instance.id)
-    assert pid_a == pid_b
+    # Either the resumed runner is still registered (same pid) or it already
+    # completed and deregistered; a second concurrent runner must never exist.
+    case Test.runner_pid(instance.id) do
+      nil -> :ok
+      pid_b -> assert pid_a == pid_b
+    end
 
     assert {:ok, %{status: :completed}} =
              Test.await_status(instance.id, :completed, config: config, timeout: 10_000)
+  end
+
+  test "recover_all never reclaims suspended workflows", %{config: config} do
+    past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Suspendable",
+        status: :suspended,
+        params: %{"token" => "parked"},
+        data: %{"step" => 1},
+        current_stage_index: 1,
+        pipeline_version: 1,
+        locked_until: past,
+        suspend_reason: "await_approval"
+      })
+
+    :ok = Recovery.recover_all(config)
+    refute Test.runner_pid(instance.id)
+    assert {:ok, %{status: :suspended}} = Interruptus.status(instance.id, config: config.name)
+  end
+
+  test "recover_all parks unresolvable workflow types as suspended", %{config: config} do
+    past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+    handler_id = "unknown-type-#{System.unique_integer()}"
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:interruptus, :recovery, :unknown_workflow_type],
+      fn _event, _measurements, metadata, _ ->
+        send(parent, {:unknown_type, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "No.Such.Workflow.Module",
+        status: :running,
+        params: %{},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1,
+        locked_by: "dead-node",
+        locked_until: past
+      })
+
+    :ok = Recovery.recover_all(config)
+
+    assert_receive {:unknown_type, %{workflow_type: "No.Such.Workflow.Module"}}, 1_000
+    refute Test.runner_pid(instance.id)
+
+    row = Store.get(config, instance.id)
+    assert row.status == :suspended
+    assert row.suspend_reason == "unknown_workflow_type"
+    assert row.locked_by == nil
+    assert row.lock_version == instance.lock_version + 1
   end
 
   test "start_runner returns existing pid when runner already registered", %{config: config} do

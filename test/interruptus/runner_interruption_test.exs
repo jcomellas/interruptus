@@ -81,7 +81,7 @@ defmodule Interruptus.RunnerInterruptionTest do
     assert Store.get(config, instance.id).current_stage_index == 2
   end
 
-  test "stale runner stops with lease_lost after cross-node acquire", %{config: config} do
+  test "stale runner stops without writes after cross-node acquire", %{config: config} do
     assert {:ok, instance} =
              Interruptus.start(BarrierWorkflow, %{token: "lease-lost"}, config: config.name)
 
@@ -102,7 +102,10 @@ defmodule Interruptus.RunnerInterruptionTest do
 
     :ok = Barrier.release(:before_checkpoint)
 
-    assert_receive {:DOWN, ^ref, :process, ^stale_pid, :lease_lost}, 5_000
+    # The stale runner stops either at its next fenced write (:normal) or when
+    # its heartbeat renewal fails (:lease_lost) — whichever happens first.
+    assert_receive {:DOWN, ^ref, :process, ^stale_pid, reason}, 5_000
+    assert reason in [:normal, :lease_lost]
     refute Process.alive?(stale_pid)
 
     case Test.runner_pid(instance.id) do
@@ -182,10 +185,14 @@ defmodule Interruptus.RunnerInterruptionTest do
     :ok = Test.await_barrier_held(:before_checkpoint)
     :ok = Test.expire_lease(config, instance.id)
 
-    assert {:ok, %{status: :cancelled}} = Interruptus.cancel(instance.id, config: config.name)
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.cancel(instance.id, config: config.name, compensate: false, force: true)
     assert {:error, :terminal} = Interruptus.resume(instance.id, config: config.name)
 
-    :ok = Test.crash_runner(instance.id)
+    # The fenced runner may already have stopped via its heartbeat; crash it
+    # if it is still around and release the barrier either way.
+    _ = Test.crash_runner(instance.id)
+    :ok = Barrier.release(:before_checkpoint)
 
     assert {:ok, %{status: :cancelled}} = Interruptus.status(instance.id, config: config.name)
   end

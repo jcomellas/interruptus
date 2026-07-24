@@ -15,6 +15,8 @@ defmodule Interruptus.Test do
       assert {:ok, %{status: :completed}} = Interruptus.Test.await_status(id, :completed)
   """
 
+  import ExUnit.Assertions
+
   alias Interruptus.Claim
   alias Interruptus.Config
   alias Interruptus.Schemas.WorkflowInstance
@@ -112,10 +114,16 @@ defmodule Interruptus.Test do
 
   @doc """
   Returns the registered runner pid for a workflow, or `nil`.
+
+  ## Options
+
+    * `:config` - Interruptus config struct or name (default `Interruptus.Config.fetch/0`)
   """
-  @spec runner_pid(Ecto.UUID.t()) :: pid() | nil
-  def runner_pid(workflow_id) do
-    case Registry.lookup(Interruptus.Registry, workflow_id) do
+  @spec runner_pid(Ecto.UUID.t(), keyword()) :: pid() | nil
+  def runner_pid(workflow_id, opts \\ []) do
+    config = resolve_config(opts)
+
+    case Registry.lookup(Config.registry_name(config), workflow_id) do
       [{pid, _}] -> pid
       [] -> nil
     end
@@ -127,32 +135,120 @@ defmodule Interruptus.Test do
   After the lease expires, `Interruptus.Recovery` should reclaim and restart
   execution. Use with `expire_lease/2` and `await_status/3` to verify recovery.
 
+  ## Options
+
+    * `:config` - Interruptus config struct or name (default `Interruptus.Config.fetch/0`)
+
   ## Returns
 
     * `:ok` - runner was killed
     * `{:error, :not_running}` - no runner registered for this id
   """
-  @spec crash_runner(Ecto.UUID.t()) :: :ok | {:error, :not_running}
-  def crash_runner(workflow_id) do
-    case runner_pid(workflow_id) do
+  @spec crash_runner(Ecto.UUID.t(), keyword()) :: :ok | {:error, :not_running}
+  def crash_runner(workflow_id, opts \\ []) do
+    config = resolve_config(opts)
+
+    case runner_pid(workflow_id, opts) do
       nil ->
         {:error, :not_running}
 
       pid ->
-        _ = DynamicSupervisor.terminate_child(Interruptus.RunnerSupervisor, pid)
-        wait_for_runner_exit(workflow_id)
+        _ =
+          DynamicSupervisor.terminate_child(Config.runner_supervisor_name(config), pid)
+
+        wait_for_runner_exit(workflow_id, opts)
     end
   end
 
-  @spec wait_for_runner_exit(Ecto.UUID.t()) :: :ok
-  defp wait_for_runner_exit(workflow_id) do
+  @spec wait_for_runner_exit(Ecto.UUID.t(), keyword()) :: :ok
+  defp wait_for_runner_exit(workflow_id, opts) do
     deadline = System.monotonic_time(:millisecond) + 2_000
 
-    if runner_pid(workflow_id) == nil or System.monotonic_time(:millisecond) >= deadline do
+    if runner_pid(workflow_id, opts) == nil or
+         System.monotonic_time(:millisecond) >= deadline do
       :ok
     else
       Process.sleep(20)
-      wait_for_runner_exit(workflow_id)
+      wait_for_runner_exit(workflow_id, opts)
+    end
+  end
+
+  @spec resolve_config(keyword()) :: Config.t()
+  defp resolve_config(opts) do
+    case Keyword.get(opts, :config) do
+      %Config{} = config -> config
+      nil -> Config.fetch()
+      name when is_atom(name) -> Config.fetch(name)
+    end
+  end
+
+  @doc """
+  Assigns a `workflow_id` on a command so `Interruptus.Effect` helpers work in tests.
+
+  Durable runners set this automatically; in-memory `Workflow.new/1` / `run/1`
+  leave it `nil`.
+  """
+  @spec assign_workflow_id(struct(), Ecto.UUID.t()) :: struct()
+  def assign_workflow_id(%{} = command, workflow_id) when is_binary(workflow_id) do
+    %{command | workflow_id: workflow_id}
+  end
+
+  @doc """
+  Asserts an applied effect marker exists for the workflow.
+
+  ## Options
+
+    * `:config` - Interruptus config struct or name
+  """
+  @spec assert_effect_applied(Ecto.UUID.t() | struct(), String.t(), keyword()) :: :ok
+  def assert_effect_applied(command_or_id, effect_key, opts \\ []) do
+    unless Interruptus.Effect.exists?(command_or_id, effect_key, opts) do
+      flunk("expected applied effect #{inspect(effect_key)} for #{inspect(command_or_id)}")
+    end
+
+    :ok
+  end
+
+  @doc """
+  Polls until the workflow's `current_stage_index` equals `expected_index`.
+
+  ## Options
+
+    * `:config` - Interruptus config (default `Interruptus.Config.fetch/0`)
+    * `:timeout` - max wait in ms (default `5_000`)
+    * `:interval` - poll interval in ms (default `50`)
+  """
+  @spec await_stage_index(Ecto.UUID.t(), non_neg_integer(), keyword()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :timeout}
+  def await_stage_index(workflow_id, expected_index, opts \\ [])
+      when is_integer(expected_index) and expected_index >= 0 do
+    config = Keyword.get(opts, :config, Config.fetch())
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    interval = Keyword.get(opts, :interval, 50)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    do_await_stage_index(config, workflow_id, expected_index, deadline, interval)
+  end
+
+  @spec do_await_stage_index(
+          Config.t(),
+          Ecto.UUID.t(),
+          non_neg_integer(),
+          integer(),
+          non_neg_integer()
+        ) :: {:ok, WorkflowInstance.t()} | {:error, :timeout}
+  defp do_await_stage_index(config, workflow_id, expected_index, deadline, interval) do
+    case Store.get(config, workflow_id) do
+      %WorkflowInstance{current_stage_index: ^expected_index} = instance ->
+        {:ok, instance}
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(interval)
+          do_await_stage_index(config, workflow_id, expected_index, deadline, interval)
+        end
     end
   end
 

@@ -1,20 +1,22 @@
 defmodule Interruptus.Test.Support.Runtime do
   @moduledoc false
 
+  alias Interruptus.Config
   alias Interruptus.Test.Support.Runtime.SupervisorLock
 
-  @otp_children [
-    Interruptus.Registry,
-    Interruptus.RunnerSupervisor,
-    Interruptus.Recovery
-  ]
+  # Options for the default test instance. Merged over config/test.exs app env
+  # (repo, lease timings). Recovery scans are disabled: tests drive recovery
+  # explicitly via Interruptus.Recovery.recover_all/1.
+  @instance_opts [recovery_schedule: false]
 
   @doc """
-  Ensures the `:interruptus` application and its OTP children are running.
+  Ensures the default Interruptus instance supervision tree is running.
 
-  Serializes access with `SupervisorLock` so parallel test modules cannot
-  race on shared Registry / supervisor processes. Repairs the OTP tree when
-  the application is marked started but children have exited.
+  Since the tree normally lives under a host application supervisor, tests
+  start it detached (unlinked) so the calling test process's exit does not
+  tear it down. Serializes access with `SupervisorLock` so parallel test
+  modules cannot race on shared processes, and repairs the tree if children
+  have exited.
   """
   @spec start!() :: :ok
   def start! do
@@ -46,94 +48,87 @@ defmodule Interruptus.Test.Support.Runtime do
 
   @spec do_start!() :: :ok
   defp do_start! do
-    case Application.ensure_all_started(:interruptus) do
-      {:ok, _} -> :ok
-      {:error, {:already_started, _}} -> :ok
-      {:error, reason} -> raise_otp_error(reason)
-    end
-
-    if otp_healthy?() do
+    if tree_healthy?() do
       :ok
     else
-      restart_application!()
+      restart_tree!()
     end
   end
 
-  @spec restart_application!() :: :ok
-  defp restart_application! do
-    if application_started?(:interruptus) do
-      :ok = Application.stop(:interruptus)
-      wait_for_application_stop(:interruptus)
+  @spec restart_tree!() :: :ok
+  defp restart_tree! do
+    sup_name = Config.supervisor_name(Interruptus)
+
+    if pid = Process.whereis(sup_name) do
+      ref = Process.monitor(pid)
+      Process.exit(pid, :shutdown)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _} -> :ok
+      after
+        5_000 -> raise "Interruptus test supervision tree did not stop"
+      end
     end
 
-    case Application.ensure_all_started(:interruptus) do
-      {:ok, _} -> verify_healthy!()
-      {:error, {:already_started, _}} -> verify_healthy!()
-      {:error, reason} -> raise_otp_error(reason)
+    case Interruptus.Supervisor.start_link(@instance_opts) do
+      {:ok, pid} ->
+        # The tree must survive the (transient) process that repaired it.
+        Process.unlink(pid)
+        verify_healthy!()
+
+      {:error, {:already_started, _pid}} ->
+        verify_healthy!()
+
+      {:error, reason} ->
+        raise "failed to start Interruptus test supervision tree: #{inspect(reason)}"
     end
   end
 
   @spec verify_healthy!() :: :ok
   defp verify_healthy! do
-    if otp_healthy?() do
+    if tree_healthy?() do
       :ok
     else
-      missing = Enum.reject(@otp_children, &Process.whereis/1)
+      missing = Enum.reject(tree_children(), &Process.whereis/1)
 
-      raise "Interruptus OTP children are not running after restart: #{inspect(missing)}"
+      raise "Interruptus tree children are not running after restart: #{inspect(missing)}"
     end
   end
 
-  @spec otp_healthy?() :: boolean()
-  defp otp_healthy? do
-    Enum.all?(@otp_children, &Process.whereis/1)
+  @spec tree_children() :: [atom()]
+  defp tree_children do
+    [
+      Config.registry_name(Interruptus),
+      Config.task_supervisor_name(Interruptus),
+      Config.runner_supervisor_name(Interruptus),
+      Config.recovery_name(Interruptus)
+    ]
   end
 
-  @spec application_started?(atom()) :: boolean()
-  defp application_started?(app) do
-    Enum.any?(Application.started_applications(), fn {started_app, _, _} ->
-      started_app == app
-    end)
-  end
-
-  @spec wait_for_application_stop(atom()) :: :ok
-  defp wait_for_application_stop(app) do
-    deadline = System.monotonic_time(:millisecond) + 5_000
-    do_wait_for_application_stop(app, deadline)
-  end
-
-  @spec do_wait_for_application_stop(atom(), integer()) :: :ok
-  defp do_wait_for_application_stop(app, deadline) do
-    if application_started?(app) and System.monotonic_time(:millisecond) < deadline do
-      Process.sleep(10)
-      do_wait_for_application_stop(app, deadline)
-    else
-      :ok
-    end
-  end
-
-  @spec raise_otp_error(term()) :: no_return()
-  defp raise_otp_error(reason) do
-    raise "failed to start :interruptus application: #{inspect(reason)}"
+  @spec tree_healthy?() :: boolean()
+  defp tree_healthy? do
+    Enum.all?([Config.supervisor_name(Interruptus) | tree_children()], &Process.whereis/1)
   end
 
   @spec do_cleanup!() :: :ok
   defp do_cleanup! do
-    if Process.whereis(Interruptus.RunnerSupervisor) do
-      stop_all_runners()
-      wait_for_runners(System.monotonic_time(:millisecond) + 2_000)
+    runner_sup = Config.runner_supervisor_name(Interruptus)
+
+    if Process.whereis(runner_sup) do
+      stop_all_runners(runner_sup)
+      wait_for_runners(runner_sup, System.monotonic_time(:millisecond) + 2_000)
     end
 
     :ok
   end
 
-  @spec stop_all_runners() :: :ok
-  defp stop_all_runners do
-    Interruptus.RunnerSupervisor
+  @spec stop_all_runners(atom()) :: :ok
+  defp stop_all_runners(runner_sup) do
+    runner_sup
     |> DynamicSupervisor.which_children()
     |> Enum.each(fn
       {_, pid, _, _} when is_pid(pid) ->
-        _ = DynamicSupervisor.terminate_child(Interruptus.RunnerSupervisor, pid)
+        _ = DynamicSupervisor.terminate_child(runner_sup, pid)
 
       _ ->
         :ok
@@ -142,19 +137,19 @@ defmodule Interruptus.Test.Support.Runtime do
     :ok
   end
 
-  @spec wait_for_runners(integer()) :: :ok
-  defp wait_for_runners(deadline) do
-    if runner_children_empty?() or System.monotonic_time(:millisecond) >= deadline do
+  @spec wait_for_runners(atom(), integer()) :: :ok
+  defp wait_for_runners(runner_sup, deadline) do
+    if runner_children_empty?(runner_sup) or System.monotonic_time(:millisecond) >= deadline do
       :ok
     else
       Process.sleep(20)
-      wait_for_runners(deadline)
+      wait_for_runners(runner_sup, deadline)
     end
   end
 
-  @spec runner_children_empty?() :: boolean()
-  defp runner_children_empty? do
-    case DynamicSupervisor.which_children(Interruptus.RunnerSupervisor) do
+  @spec runner_children_empty?(atom()) :: boolean()
+  defp runner_children_empty?(runner_sup) do
+    case DynamicSupervisor.which_children(runner_sup) do
       [] -> true
       children -> Enum.all?(children, fn {_, pid, _, _} -> not is_pid(pid) end)
     end

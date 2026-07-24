@@ -167,7 +167,25 @@ defmodule Interruptus.Repo do
   end
 
   @doc """
-  Executes a raw SQL query.
+  Executes a bulk delete query.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `queryable` - Ecto query identifying rows to delete
+    * `opts` - passed to host repo `delete_all/2`
+
+  ## Returns
+
+    * `{count, nil}` - number of rows deleted
+  """
+  @spec delete_all(Config.t(), Ecto.Queryable.t(), keyword()) :: {non_neg_integer(), nil}
+  def delete_all(config, queryable, opts \\ []) do
+    config.repo.delete_all(queryable, repo_opts(config, opts))
+  end
+
+  @doc """
+  Executes a raw SQL request.
 
   ## Arguments
 

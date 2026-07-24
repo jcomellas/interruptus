@@ -53,14 +53,23 @@ A group of stages bounded by a checkpoint marker. On reaching a checkpoint, the 
 
 JSON-serialized workflow state stored on the workflow row and appended to `interruptus_checkpoints` for audit.
 
-### Lease
+### Lease and fencing
 
-`locked_by`, `locked_until`, and `lock_version` on the workflow row. The active Runner renews the lease periodically. Stale leases allow Recovery to reclaim the workflow on another node.
+`locked_by`, `locked_until`, and `lock_version` on the workflow row. The active Runner renews the lease periodically (heartbeats run **concurrently** with stage execution, so stages longer than the lease duration do not lose it). Stale leases allow Recovery to reclaim the workflow on another node.
+
+`lock_version` is a true fencing token:
+
+- **Every state-changing write bumps it**: claim, checkpoint, attempt accounting, suspend, complete, fail, compensation progress, `cancel`, `resume`, and lease release.
+- Lease **renewal** extends `locked_until` without bumping the version — renewal is lease maintenance, not a state change, so API writes (e.g. `cancel/2`) never race the heartbeat.
+- Runner-originated writes are additionally **holder-guarded** (`locked_by = node AND locked_until > now()`), so a runner with an expired lease cannot write even before another node re-claims.
+- On any `:stale_lock`, a runner stops cleanly without further writes. This is how `cancel/2` fences a live runner mid-stage.
+
+Attempt accounting is crash-durable: `attempt_count` is persisted **before** each execution attempt of the current segment span and reset to `0` at every successful checkpoint. A workflow that crash-loops is bounded by `restart_policy.max_attempts` across process deaths and node restarts (poison pills end in rollback, not an infinite reclaim loop).
 
 ### Policies
 
-- **Restart policy** — retry failed segments with backoff before rollback.
-- **Rollback policy** — LIFO compensation functions for completed checkpoint segments.
+- **Restart policy** — retry failed segments with backoff before rollback. Applies to all failure modes: `halt/2`, error tuples, raised exceptions, throws, exits, verify failures, and stage timeouts (`stage_timeout` DSL option).
+- **Rollback policy** — LIFO compensation over **passed and in-flight** checkpoints (`checkpoint compensate: :undo_x` requires `verify`). The checkpoint at `current_stage_index` is included when it declares `compensate:` (tentative undo for side effects that may have applied before the durable snapshot). Compensations **must be idempotent**. The workflow-level `rollback_policy compensate: [...]` list is appended after them. Progress is persisted per step (`compensation_index`); `:compensating` workflows are reclaimable. Exhaustion yields `:failed`; `Interruptus.resume/2` retries compensation from where it stopped.
 
 ## Lifecycle
 
@@ -68,50 +77,105 @@ JSON-serialized workflow state stored on the workflow row and appended to `inter
 stateDiagram-v2
   [*] --> pending: start
   pending --> running: claim
-  running --> running: checkpoint
-  running --> suspended: explicit_suspend
+  running --> running: checkpoint / retry / lease reclaim
+  running --> suspended: explicit_suspend or identity mismatch
   running --> completed: terminal_success
-  running --> failed: unrecoverable
-  running --> compensating: rollback_triggered
-  suspended --> running: resume
-  failed --> compensating: rollback_policy
-  compensating --> compensated: success
-  compensating --> failed: compensation_failed
-  pending --> cancelled: cancel
-  suspended --> cancelled: cancel
+  running --> failed: attempts exhausted, no compensations
+  running --> compensating: attempts exhausted, rollback
+  suspended --> pending: resume (explicit only)
+  failed --> compensating: resume (retry compensation)
+  compensating --> compensating: step persisted / lease reclaim
+  compensating --> compensated: all steps done
+  compensating --> failed: compensation exhausted
+  pending --> cancelled: cancel force or empty plan
+  running --> cancelled: cancel force
+  running --> compensating: cancel default
+  suspended --> cancelled: cancel force or empty plan
+  suspended --> compensating: cancel default
+  compensating --> cancelled: cancel force
   completed --> [*]
   compensated --> [*]
   cancelled --> [*]
-  failed --> [*]
 ```
+
+Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`. **Never** `suspended` — suspension is explicit and only `Interruptus.resume/2` (a fenced `suspended → pending` transition) brings it back. `failed` is a resting quarantine: `resume/2` transitions it to `compensating` to retry rollback. `cancel/2` defaults to `compensate: true`; plain cancel with a non-empty plan requires `force: true`. Cancel while `:compensating` requires `force: true`.
 
 ### Start
 
-1. Insert workflow row (`:pending`) with initial checkpoint snapshot.
-2. Start Runner under `RunnerSupervisor`.
-3. Runner claims row, sets `:running`, begins execution from `current_stage_index`.
+1. Insert workflow row (`:pending`) with initial checkpoint snapshot. With an
+   `:idempotency_key`, a duplicate insert returns the **existing** instance
+   (idempotent start).
+2. Start Runner under the per-instance `RunnerSupervisor`.
+3. Runner claims the row (`FOR UPDATE SKIP LOCKED`), sets `:running`
+   (preserving `:compensating` for reclaimed rollbacks), and begins execution
+   from `current_stage_index`. A runner that cannot claim stops immediately.
+4. If the persisted `pipeline_version` or `pipeline_fingerprint` differs from
+   the compiled module, the runner parks the workflow as `:suspended` with
+   reason `"pipeline_version_mismatch"` or `"pipeline_fingerprint_mismatch"`
+   instead of executing positional indexes against a different pipeline layout.
 
-### Run Segment
+### Run Span
 
-1. If segment has `verify/1`, run it against current command state.
-2. On `:done`, skip to next segment.
-3. On `:not_done`, execute segment stages in order.
-4. On checkpoint boundary, persist snapshot and advance index.
-5. On `{:suspend, ...}`, persist and set `:suspended`; release lease; stop.
+1. Persist `attempt_count + 1` (fenced, holder-guarded). An exhausted budget
+   goes straight to rollback.
+2. Execute from `current_stage_index` through the next checkpoint (or pipeline
+   end) in one supervised task (`Task.Supervisor`). Bare `:stage` segments
+   between checkpoints run in-memory only. The runner GenServer keeps
+   heartbeating while the task runs. Exceptions, throws, exits, invalid
+   return values, and `stage_timeout` expiry are contained as failures and
+   routed through the restart policy.
+3. If a segment has `verify/1`, run it first under the same `stage_timeout`:
+   `:done` skips the stages, `:not_done` runs them, `:failed` routes to the
+   restart policy. Hung verify is a timeout failure.
+4. On checkpoint boundary, persist snapshot + audit row in one fenced
+   transaction and reset `attempt_count` to `0`.
+5. On suspend, persist state and `:suspended`; release lease; stop. Prefer
+   `Command.suspend/3` when mutations must be kept; the 3-tuple form keeps
+   the pre-stage command.
+6. On failure with remaining budget, back off, reload the row (fenced), and
+   rebuild the command from the last checkpoint — the runner already holds
+   the lease and does **not** re-claim. Engine errors carry the last-good
+   command for same-process rollback.
+7. `halt(success: true)` completes the workflow as `:completed`.
 
 ### Crash Recovery
 
 1. Runner dies without releasing lease; `locked_until` eventually expires.
-2. `Interruptus.Recovery` finds reclaimable rows on boot and periodic scan.
-3. New Runner claims, loads snapshot, resumes from last checkpoint.
+2. `Interruptus.Recovery` (per instance, jittered scans) finds reclaimable
+   rows: `pending`, `running`, `compensating` — never `suspended`.
+3. New Runner claims (version bump fences the old one), loads the snapshot,
+   and resumes from the last checkpoint (or from `compensation_index` for
+   `:compensating` rows). Rows whose `workflow_type` cannot be resolved on
+   this node are parked as `:suspended` with reason `"unknown_workflow_type"`
+   (and the lease cleared) so they leave the reclaim set; an operator or a
+   node that loads the module can resume or cancel them. Reclaim scans use
+   keyset pagination so large backlogs are not truncated to a fixed oldest-N
+   window forever.
 
 ### Complete
 
-Terminal success sets `:completed`. Recovery ignores completed rows.
+Terminal success sets `:completed`. Recovery ignores terminal rows.
 
 ### Rollback
 
-On terminal failure after restart exhaustion, invoke compensation functions in LIFO order over completed segments.
+On failure after restart exhaustion, the compensation plan is computed from
+**passed and in-flight** checkpoints (segments `0..current_stage_index`
+inclusive when they declare `compensate:`) plus the workflow-level list, in
+LIFO order. Compensations must be idempotent — the in-flight segment may or
+may not have applied external work. Entering compensation persists the current
+command snapshot (params/data/errors). Each compensation function runs in a
+supervised task with the same attempt accounting; `compensation_index` (and
+command state) is persisted after each completed step. Success ends
+`:compensated`; exhaustion ends `:failed` (resumable to retry compensation
+when the plan is non-empty). An empty plan ends `:failed` directly — nothing
+was rolled back, so claiming `:compensated` would be misleading. `resume/2` on
+empty-plan `:failed` returns `{:error, :not_compensable}`.
+
+`cancel/2` defaults to compensation. With a non-empty plan it fences the row
+to `:compensating`, clears the lease, **evicts** any Registry-registered
+runner, and starts a fresh runner. Plain cancel (`compensate: false`) with a
+non-empty plan requires `force: true`. Cancel while `:compensating` requires
+`force: true`. Every successful cancel evicts any live runner.
 
 ## Data Model
 
@@ -129,11 +193,13 @@ erDiagram
     jsonb data
     int current_stage_index
     int pipeline_version
+    string pipeline_fingerprint
     string idempotency_key
     string locked_by
     datetime locked_until
     int lock_version
     int attempt_count
+    int compensation_index
     datetime inserted_at
     datetime updated_at
   }
@@ -161,8 +227,10 @@ erDiagram
     uuid id PK
     uuid workflow_id FK
     string effect_key
+    string status
     jsonb metadata
     datetime inserted_at
+    datetime updated_at
   }
 ```
 
@@ -173,7 +241,7 @@ Interruptus embeds in the host Postgres database. Stages run **outside** library
 Implications:
 
 1. Stage side effects and Interruptus checkpoints are **not** one atomic unit.
-2. Between checkpoints, stages and verify may run at-least-once — use idempotent effects, domain unique keys, `verify/1`, and `Interruptus.Effect` markers.
+2. Between checkpoints, stages and verify may run at-least-once — use idempotent effects, domain unique keys, `verify/1`, and `Interruptus.Effect` markers (`pending` → `applied` claim-before-apply).
 3. Do not call `start` / `resume` / `cancel` inside an open transaction on the configured Interruptus repo (`{:error, :in_transaction}`). Nested calls race the Runner against an uncommitted insert.
 4. `lock_version` fences workflow-row writes only. A stale runner after lease expiry can still commit host-table writes.
 5. A dedicated Interruptus Repo/pool (same DB URL) is recommended under load for connection isolation; nesting detection binds to that `:repo`.
@@ -182,7 +250,14 @@ Implications:
 
 ### Split-brain after lease expiry
 
-Old runner may still be executing when lease expires. New runner claims with incremented `lock_version`. All Interruptus writes use optimistic locking on `lock_version`; stale runner writes to workflow rows fail safely. Host-table writes are not fenced — design stages accordingly.
+Old runner may still be executing when lease expires. New runner claims with incremented `lock_version`. All Interruptus writes use optimistic locking on `lock_version` **and** runner writes require a currently valid lease held by the writing node; stale runner writes to workflow rows fail safely and the stale runner stops. Host-table writes are not fenced — design stages accordingly. Long stages do not cause spurious expiry: heartbeats renew concurrently with execution.
+
+### Cancel racing a live runner
+
+`cancel/2` bumps the fencing token and **always evicts** any registered runner.
+Default `compensate: true` starts compensation when the plan is non-empty.
+`compensate: false` with a non-empty plan requires `force: true`. A
+`:cancelled` workflow can never be resurrected to `:completed`.
 
 ### Duplicate verify execution
 
@@ -190,36 +265,66 @@ Verify runs on every resume before segment stages. Must query external or durabl
 
 ### Stale lease / crashed node
 
-Recovery reclaims when `locked_until < now()` and status is `:running` or `:suspended` or `:pending`.
+Recovery reclaims when `locked_until < now()` (or is `NULL`) and status is `:pending`, `:running`, or `:compensating`. Suspended workflows are excluded: they resume only via `Interruptus.resume/2`.
 
 ### Deploy mid-flight
 
-`pipeline_version` stored on instance. Mismatched version on resume logs warning; host may cancel or force-restart via admin API (future).
+`pipeline_version` (manual) and `pipeline_fingerprint` (automatic structural
+hash of flattened segments + workflow-level compensations) are stored on the
+instance and enforced at claim time. A mismatch parks the workflow as
+`:suspended` with reason `"pipeline_version_mismatch"` or
+`"pipeline_fingerprint_mismatch"` instead of silently executing positional
+stage indexes against a different pipeline. Recovery also parks instances
+whose `workflow_type` does not resolve on the scanning node.
+
+**Operator runbook**
+
+1. `Interruptus.list_parked/1` — inventory parked identity mismatches.
+2. Decide: cancel/compensate (`Interruptus.compensate/2` or `abandon/2`), or
+   accept the new compiled identity after a compatible deploy.
+3. `Interruptus.acknowledge_pipeline(id, force: true)` — fenced update of
+   stored version/fingerprint to the compiled module. Does **not** resume.
+   Acknowledging a **breaking** layout change can run the wrong stages —
+   prefer compensate when unsure.
+4. `Interruptus.resume/2` — continue forward execution when safe.
 
 ## API Surface
 
 ```elixir
-# Start a new workflow instance
+# Start a new workflow instance (idempotent with :idempotency_key)
 Interruptus.start(MyApp.TransferFunds, %{from_account_id: "a", ...}, opts)
 
-# Resume a suspended or failed workflow
+# Resume: suspended -> pending (forward) or failed -> compensating (rollback retry)
 Interruptus.resume(workflow_id)
 
-# Cancel a non-terminal workflow
+# Signal a suspended workflow (payload stored under suspend_metadata["signal"])
+Interruptus.signal(workflow_id, %{approved_by: "ops"})
+
+# Cancel (defaults to compensate: true; evicts live runners)
 Interruptus.cancel(workflow_id)
+Interruptus.compensate(workflow_id)
+Interruptus.abandon(workflow_id)
+
+# Parked deploy skew
+Interruptus.list_parked()
+Interruptus.acknowledge_pipeline(workflow_id, force: true)
+
+# Purge old terminal rows (or enable retention_ms + purge_schedule on Recovery)
+Interruptus.purge_terminal(older_than: 30 * 24 * 60 * 60 * 1000)
 
 # Query status
 Interruptus.status(workflow_id)
 
-# OTP child spec for application supervisor
+# OTP child spec for the HOST application supervisor (after the Repo).
+# Starts the per-instance tree: Registry, Task.Supervisor, RunnerSupervisor,
+# Recovery. Multiple named instances may coexist in one VM.
 {Interruptus, repo: MyApp.Repo, name: Interruptus}
 ```
 
 ## Open Questions / Future Work
 
-- Workflow migration tooling when `pipeline_version` changes.
-- Signal/callback API for external event delivery.
+- Named signal awaits / early-signal buffering.
 - Child workflow composition.
 - SQLite adapter and storage behaviour formalization.
-- Configurable retention/GC for terminal instances.
 - Admin operations: `force_restart`, `replay_from_checkpoint`.
+- Automatic `current_stage_index` remapping across pipeline edits.

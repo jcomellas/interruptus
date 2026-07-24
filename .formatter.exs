@@ -6,6 +6,8 @@ locals_without_parens = [
   data: 3,
   pipeline: 1,
   checkpoint: 1,
+  checkpoint: 2,
+  checkpoint: 3,
   verify: 1,
   restart_policy: 1,
   rollback_policy: 1,

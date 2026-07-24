@@ -59,3 +59,34 @@ Interruptus.status(workflow.id)
 
 The transfer example uses `Interruptus.Effect.once/4` and `Effect.exists?/3` in
 verify so debit/credit markers survive at-least-once replay between checkpoints.
+
+It also uses per-checkpoint compensations:
+
+```elixir
+checkpoint compensate: :reverse_debit do
+  verify :verify_debit_applied
+  pipeline :debit_account
+end
+```
+
+On failure after retries are exhausted, **passed and in-flight** checkpoints
+are compensated, LIFO (compensations must be idempotent), with progress
+persisted per step — a crash mid-rollback resumes where it stopped. Cancel
+defaults to compensation: `Interruptus.cancel(workflow.id)` (evicts any live
+runner and starts compensation when the plan is non-empty). Use
+`compensate: false, force: true` only when deliberately abandoning rollback.
+
+## Idempotent start
+
+```elixir
+{:ok, workflow} =
+  Interruptus.start(MinimalHostApp.Workflows.TransferFunds, params,
+    idempotency_key: "transfer-1234"
+  )
+
+# Retrying with the same key returns the same instance:
+{:ok, ^workflow} =
+  Interruptus.start(MinimalHostApp.Workflows.TransferFunds, params,
+    idempotency_key: "transfer-1234"
+  )
+```

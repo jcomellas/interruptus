@@ -3,17 +3,23 @@ defmodule Interruptus do
   Durable workflow pipelines for Elixir with typed params and data.
 
   Interruptus runs workflow pipelines on the BEAM with checkpoint-based durability,
-  cluster-wide exclusivity via PostgreSQL leases, and explicit suspend/resume. Workflows
-  survive process crashes and application restarts without an external orchestrator.
+  cluster-wide exclusivity via PostgreSQL leases with fencing tokens, and explicit
+  suspend/resume. Workflows survive process crashes and application restarts
+  without an external orchestrator.
 
   ## Setup
 
-  Add Interruptus to your host application supervisor:
+  Add Interruptus to your host application supervisor, **after** the Repo:
 
       children = [
         MyApp.Repo,
         {Interruptus, repo: MyApp.Repo}
       ]
+
+  This starts a per-instance supervision tree (`Interruptus.Supervisor`) with
+  the runner Registry, a `Task.Supervisor` for stage execution, the runner
+  DynamicSupervisor, and the Recovery scanner. Multiple named instances can
+  coexist (`{Interruptus, repo: MyApp.OtherRepo, name: MyApp.Interruptus}`).
 
   For pool isolation under load, pass a dedicated Repo (same database URL, separate pool)
   as `:repo`; stage code can keep using `MyApp.Repo`.
@@ -31,30 +37,43 @@ defmodule Interruptus do
   Do not call `start/3`, `resume/2`, or `cancel/2` inside an open transaction on
   the Interruptus-configured repo (`{:error, :in_transaction}`).
 
-  `lock_version` fences Interruptus workflow-row writes only — not host-table
-  mutations from a stale runner.
+  `lock_version` is a fencing token bumped by every state-changing write; it
+  fences Interruptus workflow-row writes only — not host-table mutations from
+  a stale runner.
 
   ## Lifecycle
 
   1. `start/3` inserts a `:pending` row and starts a `Interruptus.Runner`.
-  2. The runner claims the row, executes stages, and writes checkpoints.
-  3. On suspend, state is persisted and the runner stops until `resume/2`.
-  4. On crash, `Interruptus.Recovery` reclaims expired leases and restarts runners.
-  5. Terminal workflows (`:completed`, `:compensated`, `:cancelled`) are never restarted.
+  2. The runner claims the row, executes stages in a supervised task (lease
+     heartbeats continue during execution), and writes fenced checkpoints.
+  3. On suspend, state is persisted and the runner stops. Only `resume/2`
+     restarts a suspended workflow — Recovery never auto-resumes it.
+  4. On crash, `Interruptus.Recovery` reclaims expired leases and restarts
+     runners. Attempt budgets are persisted **before** execution, so crash
+     loops are bounded by the workflow `restart_policy` and end in rollback.
+  5. On failure after retries, compensation runs step-by-step with durable
+     progress (`compensation_index`); a crash mid-compensation is reclaimed
+     and resumed.
+  6. Terminal workflows (`:completed`, `:compensated`, `:cancelled`) are never
+     restarted. `:failed` workflows can be resumed to retry compensation.
 
   See `Interruptus.Workflow` for defining workflows and `DESIGN.md` for architecture.
   """
 
   alias Interruptus.Config
+  alias Interruptus.Policy.Rollback
   alias Interruptus.RunnerSupervisor
   alias Interruptus.Schemas.WorkflowInstance
   alias Interruptus.Store
+  alias Interruptus.WorkflowType
+
+  @cancel_retries 3
 
   @doc """
   Returns a child spec for the host application supervisor.
 
-  Merges `opts` into `Interruptus.Config` and stores it via `Interruptus.Config.put/1`
-  when the child starts.
+  Starts `Interruptus.Supervisor` (per-instance Registry, Task.Supervisor,
+  RunnerSupervisor, and Recovery) with the merged `Interruptus.Config`.
 
   ## Arguments
 
@@ -68,6 +87,7 @@ defmodule Interruptus do
     * `:lease_duration` - lease TTL in ms (default `30_000`)
     * `:heartbeat_interval` - lease renewal interval in ms (default `10_000`)
     * `:recovery_interval` - stale-workflow scan interval in ms (default `5_000`)
+    * `:recovery_schedule` - enable periodic recovery scans (default `true`)
 
   ## Returns
 
@@ -79,23 +99,20 @@ defmodule Interruptus do
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
-    config = Config.new(opts) |> Config.put()
+    name = Keyword.get(opts, :name, Interruptus)
 
     %{
-      id: config.name,
-      start: {__MODULE__, :start_link, [opts]},
+      id: name,
+      start: {Interruptus.Supervisor, :start_link, [opts]},
       type: :supervisor
     }
   end
 
-  # Starts Interruptus and runs an initial recovery scan.
-  # Called by the supervisor via child_spec/1. Returns :ignore.
+  # Starts the per-instance supervision tree. Called via child_spec/1.
   @doc false
-  @spec start_link(keyword()) :: :ignore
+  @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
-    config = Config.new(opts) |> Config.put()
-    Interruptus.Recovery.recover_all(config)
-    :ignore
+    Interruptus.Supervisor.start_link(opts)
   end
 
   @doc """
@@ -104,6 +121,10 @@ defmodule Interruptus do
   Inserts a `:pending` row (with an initial checkpoint), then starts a
   `Interruptus.Runner` under `Interruptus.RunnerSupervisor`.
 
+  When `:idempotency_key` is given and an instance with the same key and
+  workflow type already exists, the **existing** instance is returned
+  (`{:ok, instance}`), making `start/3` safe to retry.
+
   ## Arguments
 
     * `workflow_module` - module using `Interruptus.Workflow`
@@ -111,17 +132,18 @@ defmodule Interruptus do
 
   ## Options
 
-    * `:idempotency_key` - optional unique key per workflow type; duplicate keys
-      cause insert failure via the database unique index
+    * `:idempotency_key` - optional unique key per workflow type; duplicate
+      keys return the existing instance
     * `:config` - Interruptus config name atom (default `Interruptus`)
 
   ## Returns
 
-    * `{:ok, %WorkflowInstance{}}` - instance row with generated `id`
+    * `{:ok, %WorkflowInstance{}}` - new or existing instance row. Durable even
+      when an immediate runner start fails; Recovery reclaims lease-less
+      `:pending` rows.
     * `{:error, %Ecto.Changeset{}}` - validation or constraint failure on insert
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo (rejected to avoid nested-savepoint races)
-    * `{:error, term()}` - runner could not be started
 
   ## Examples
 
@@ -132,38 +154,67 @@ defmodule Interruptus do
           {:ok, WorkflowInstance.t()} | {:error, term()}
   def start(workflow_module, params, opts \\ []) do
     config = config_from_opts(opts)
+    workflow_type = workflow_module |> Module.split() |> Enum.join(".")
+    idempotency_key = Keyword.get(opts, :idempotency_key)
 
     with :ok <- reject_in_transaction(config),
          {:ok, cast_params} <- workflow_module.cast_params(params),
          {:ok, dumped_params} <- workflow_module.dump_params(cast_params),
-         {:ok, dumped_data} <- workflow_module.dump_data(%{}),
-         {:ok, instance} <-
-           Store.insert_workflow(config, %{
-             workflow_type: workflow_module |> Module.split() |> Enum.join("."),
-             status: :pending,
-             params: dumped_params,
-             data: dumped_data,
-             current_stage_index: 0,
-             pipeline_version: workflow_module.pipeline_version(),
-             idempotency_key: Keyword.get(opts, :idempotency_key)
-           }),
-         {:ok, _pid} <- RunnerSupervisor.start_runner(config, workflow_module, instance.id) do
-      :telemetry.execute(
-        [:interruptus, :workflow, :started],
-        %{},
-        %{workflow_id: instance.id, workflow_type: instance.workflow_type}
-      )
+         {:ok, dumped_data} <- workflow_module.dump_data(struct(workflow_module).data) do
+      attrs = %{
+        workflow_type: workflow_type,
+        status: :pending,
+        params: dumped_params,
+        data: dumped_data,
+        current_stage_index: 0,
+        pipeline_version: workflow_module.pipeline_version(),
+        pipeline_fingerprint: workflow_module.pipeline_fingerprint(),
+        idempotency_key: idempotency_key
+      }
 
-      {:ok, instance}
+      case insert_or_existing(config, workflow_type, idempotency_key, attrs) do
+        {:ok, instance} ->
+          case RunnerSupervisor.start_runner(config, workflow_module, instance.id) do
+            {:ok, _pid} ->
+              :telemetry.execute(
+                [:interruptus, :workflow, :started],
+                %{},
+                %{workflow_id: instance.id, workflow_type: instance.workflow_type}
+              )
+
+              {:ok, instance}
+
+            {:error, reason} ->
+              # Row is durable and reclaimable; Recovery will start the runner.
+              emit_runner_start_failed(instance.id, :pending, reason)
+
+              :telemetry.execute(
+                [:interruptus, :workflow, :started],
+                %{},
+                %{workflow_id: instance.id, workflow_type: instance.workflow_type}
+              )
+
+              {:ok, instance}
+          end
+
+        error ->
+          error
+      end
     end
   end
 
   @doc """
-  Resumes a suspended or reclaimable workflow by starting a new runner.
+  Resumes a suspended or failed workflow by starting a new runner.
 
-  Looks up the instance, verifies it is not terminal, resolves the workflow module
-  from `workflow_type`, and starts a runner. If a runner is already registered for
-  the workflow id, `Interruptus.RunnerSupervisor` returns the existing pid.
+  Performs a **fenced** status transition first (bumping `lock_version`, which
+  stops any stale runner at its next write):
+
+    * `:suspended` → `:pending` — forward execution continues from the
+      suspension point
+    * `:failed` → `:compensating` — compensation is retried from the persisted
+      `compensation_index`
+    * other non-terminal statuses are left unchanged (a runner is simply
+      ensured, e.g. after lease expiry)
 
   ## Arguments
 
@@ -178,6 +229,11 @@ defmodule Interruptus do
     * `{:ok, pid()}` - runner process pid (new or existing)
     * `{:error, :not_found}` - no row with that id
     * `{:error, :terminal}` - workflow is `:completed`, `:compensated`, or `:cancelled`
+    * `{:error, :stale_lock}` - concurrent update; safe to retry
+    * `{:error, :unknown_workflow_type}` - `workflow_type` does not resolve to
+      a loaded workflow module on this node
+    * `{:error, :not_compensable}` - `:failed` workflow has an empty compensation
+      plan; status stays `:failed`
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo
     * `{:error, term()}` - runner could not be started
@@ -189,7 +245,8 @@ defmodule Interruptus do
     with :ok <- reject_in_transaction(config),
          %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
          false <- WorkflowInstance.terminal?(instance),
-         workflow_module <- module_from_type(instance.workflow_type),
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+         {:ok, _prepared} <- prepare_resume(config, workflow_module, instance),
          {:ok, pid} <- RunnerSupervisor.start_runner(config, workflow_module, workflow_id) do
       :telemetry.execute(
         [:interruptus, :workflow, :resumed],
@@ -206,10 +263,93 @@ defmodule Interruptus do
   end
 
   @doc """
+  Delivers a signal payload to a `:suspended` workflow and resumes it.
+
+  Merges `payload` into `suspend_metadata` under the `"signal"` key, then
+  performs the same fenced `:suspended → :pending` transition as `resume/2`
+  (preserving that metadata so callers can read it via `status/2`). Recovery
+  still never auto-resumes `:suspended` workflows.
+
+  ## Arguments
+
+    * `workflow_id` - UUID of the workflow instance
+    * `payload` - JSON-serializable map (default `%{}`)
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+
+  ## Returns
+
+    * `{:ok, pid()}` - runner process pid
+    * `{:error, :not_found}` - no row with that id
+    * `{:error, :not_suspended}` - workflow is not `:suspended`
+    * `{:error, :stale_lock}` - concurrent update; safe to retry
+    * `{:error, :unknown_workflow_type}` - module not loaded on this node
+    * `{:error, :in_transaction}` - called inside an open transaction
+  """
+  @spec signal(Ecto.UUID.t()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id) when is_binary(workflow_id) do
+    signal(workflow_id, %{}, [])
+  end
+
+  @spec signal(Ecto.UUID.t(), map() | keyword()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id, opts) when is_binary(workflow_id) and is_list(opts) do
+    signal(workflow_id, %{}, opts)
+  end
+
+  def signal(workflow_id, payload) when is_binary(workflow_id) and is_map(payload) do
+    signal(workflow_id, payload, [])
+  end
+
+  @spec signal(Ecto.UUID.t(), map(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def signal(workflow_id, payload, opts) when is_map(payload) and is_list(opts) do
+    config = config_from_opts(opts)
+
+    with :ok <- reject_in_transaction(config),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id) || :not_found,
+         :ok <- require_suspended(instance),
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+         metadata <-
+           Map.put(instance.suspend_metadata || %{}, "signal", stringify_keys(payload)),
+         {:ok, _prepared} <-
+           Store.update_with_lock(config, instance, %{
+             status: :pending,
+             suspend_reason: nil,
+             suspend_metadata: metadata,
+             attempt_count: 0
+           }),
+         {:ok, pid} <- RunnerSupervisor.start_runner(config, workflow_module, workflow_id) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :signaled],
+        %{},
+        %{workflow_id: workflow_id}
+      )
+
+      {:ok, pid}
+    else
+      :not_found -> {:error, :not_found}
+      {:error, _} = error -> error
+      error -> error
+    end
+  end
+
+  @doc """
   Cancels a non-terminal workflow.
 
-  Sets status to `:cancelled` and clears the lease (`locked_by`, `locked_until`).
-  Requires a successful optimistic lock on `lock_version`.
+  The cancel write bumps `lock_version` (fencing token), so a live runner —
+  even one holding a valid lease — fails its next write with `:stale_lock`
+  and stops without further side effects on the workflow row. Any registered
+  runner is always evicted after a successful cancel write.
+
+  **Defaults to `compensate: true`**: when the compensation plan is non-empty,
+  the workflow transitions to `:compensating` instead of `:cancelled`. Pass
+  `compensate: false` with `force: true` to abandon compensation (operator
+  accepts inconsistent external state).
+
+  Cancel while `:compensating` requires `force: true` (`:compensation_in_progress`).
+
+  Retries the fenced write a few times when it races runner writes.
 
   ## Arguments
 
@@ -218,40 +358,76 @@ defmodule Interruptus do
   ## Options
 
     * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:compensate` - run compensations for passed/in-flight checkpoints
+      (default `true`)
+    * `:force` - allow abandoning compensation or interrupting `:compensating`
+      (default `false`)
 
   ## Returns
 
-    * `{:ok, %WorkflowInstance{}}` - updated instance with `:cancelled` status
+    * `{:ok, %WorkflowInstance{}}` - updated instance (`:cancelled`, or
+      `:compensating` when compensating)
     * `{:error, :not_found}` - no row with that id
     * `{:error, :terminal}` - workflow is already terminal
-    * `{:error, :stale_lock}` - another runner holds a newer `lock_version`
+    * `{:error, :compensation_required}` - plain cancel refused; use default
+      compensate or `force: true`
+    * `{:error, :compensation_in_progress}` - cancel during `:compensating`
+      without `force: true`
+    * `{:error, :stale_lock}` - persistent write races; safe to retry
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo
   """
   @spec cancel(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
   def cancel(workflow_id, opts \\ []) do
     config = config_from_opts(opts)
+    compensate? = Keyword.get(opts, :compensate, true)
+    force? = Keyword.get(opts, :force, false)
 
-    with :ok <- reject_in_transaction(config),
-         %WorkflowInstance{} = instance <- Store.get(config, workflow_id),
-         false <- WorkflowInstance.terminal?(instance),
-         {:ok, cancelled} <-
-           Store.update_with_lock(config, instance, %{
-             status: :cancelled,
-             locked_by: nil,
-             locked_until: nil
-           }) do
-      :telemetry.execute(
-        [:interruptus, :workflow, :cancelled],
-        %{},
-        %{workflow_id: workflow_id}
-      )
+    with :ok <- reject_in_transaction(config) do
+      do_cancel(config, workflow_id, compensate?, force?, @cancel_retries)
+    end
+  end
 
-      {:ok, cancelled}
-    else
-      nil -> {:error, :not_found}
-      true -> {:error, :terminal}
-      error -> error
+  @doc """
+  Cancels a workflow with compensation (explicit form of the `cancel/2` default).
+
+  Equivalent to `cancel(workflow_id, Keyword.put(opts, :compensate, true))`.
+  """
+  @spec compensate(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  def compensate(workflow_id, opts \\ []) do
+    cancel(workflow_id, Keyword.put(opts, :compensate, true))
+  end
+
+  @doc """
+  Abandons a workflow without compensation.
+
+  Equivalent to `cancel(workflow_id, compensate: false, force: true)` merged
+  with `opts`. Use when an operator accepts inconsistent external state.
+  """
+  @spec abandon(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  def abandon(workflow_id, opts \\ []) do
+    cancel(workflow_id, Keyword.merge(opts, compensate: false, force: true))
+  end
+
+  @doc """
+  Retries compensation for a `:failed` workflow.
+
+  Equivalent to `resume/2` but returns `{:error, :not_failed}` when the
+  instance is not in `:failed` status.
+  """
+  @spec retry_compensation(Ecto.UUID.t(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def retry_compensation(workflow_id, opts \\ []) do
+    config = config_from_opts(opts)
+
+    case Store.get(config, workflow_id) do
+      %WorkflowInstance{status: :failed} ->
+        resume(workflow_id, opts)
+
+      %WorkflowInstance{} ->
+        {:error, :not_failed}
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
@@ -282,6 +458,396 @@ defmodule Interruptus do
     end
   end
 
+  @doc """
+  Resolves the segment name at a workflow index, or for a persisted instance.
+
+  Checkpoint names default to the `verify` atom when set, otherwise the first
+  pipeline atom. Pass an explicit `checkpoint :name do` (or `name:`) to override.
+  Bare stages use their pipeline function atom.
+
+  ## Arguments
+
+    * When the first argument is a workflow module, the second is a
+      non-negative segment index.
+    * When the first argument is a workflow UUID, options may include `:config`.
+
+  ## Returns
+
+    * `{:ok, atom()}` - segment name
+    * `{:ok, nil}` - index past the end of the pipeline (or empty name)
+    * `{:error, :not_found}` - unknown workflow id
+    * `{:error, :unknown_workflow_type}` - module not loaded on this node
+  """
+  @spec segment_name(module() | Ecto.UUID.t(), non_neg_integer() | keyword()) ::
+          {:ok, atom() | nil} | {:error, term()}
+  def segment_name(workflow_module, index)
+      when is_atom(workflow_module) and is_integer(index) and index >= 0 do
+    case Enum.at(workflow_module.flattened_pipelines(), index) do
+      %{name: name} -> {:ok, name}
+      nil -> {:ok, nil}
+    end
+  end
+
+  def segment_name(workflow_id, opts) when is_binary(workflow_id) and is_list(opts) do
+    with {:ok, instance} <- status(workflow_id, opts),
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type) do
+      segment_name(workflow_module, instance.current_stage_index)
+    end
+  end
+
+  @spec segment_name(Ecto.UUID.t()) :: {:ok, atom() | nil} | {:error, term()}
+  def segment_name(workflow_id) when is_binary(workflow_id) do
+    segment_name(workflow_id, [])
+  end
+
+  @doc """
+  Lists workflows parked for pipeline identity or unknown-type reasons.
+
+  Returns `:suspended` rows whose `suspend_reason` is one of
+  `pipeline_fingerprint_mismatch`, `pipeline_version_mismatch`, or
+  `unknown_workflow_type`.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` keyset cursor
+    * `:reasons` - override the default reason list
+  """
+  @spec list_parked(keyword()) :: [WorkflowInstance.t()]
+  def list_parked(opts \\ []) do
+    config = config_from_opts(opts)
+    store_opts = Keyword.take(opts, [:limit, :after, :reasons])
+    Store.list_parked(config, store_opts)
+  end
+
+  @doc """
+  Accepts the currently compiled pipeline identity for a parked workflow.
+
+  Updates stored `pipeline_version` and `pipeline_fingerprint` to match the
+  loaded workflow module. Does **not** resume the workflow — call `resume/2`
+  afterwards when the layout is compatible.
+
+  **Warning:** acknowledging a breaking layout change can execute the wrong
+  stages against positional indexes. Prefer cancel/compensate when unsure.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:force` - required `true` to perform the update
+  """
+  @spec acknowledge_pipeline(Ecto.UUID.t(), keyword()) ::
+          {:ok, WorkflowInstance.t()} | {:error, term()}
+  def acknowledge_pipeline(workflow_id, opts \\ []) do
+    config = config_from_opts(opts)
+    force? = Keyword.get(opts, :force, false)
+
+    with :ok <- reject_in_transaction(config),
+         :ok <- require_force(force?),
+         %WorkflowInstance{} = instance <- Store.get(config, workflow_id) || :not_found,
+         {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+         {:ok, updated} <-
+           Store.update_with_lock(config, instance, %{
+             pipeline_version: workflow_module.pipeline_version(),
+             pipeline_fingerprint: workflow_module.pipeline_fingerprint()
+           }) do
+      :telemetry.execute(
+        [:interruptus, :workflow, :pipeline_acknowledged],
+        %{},
+        %{
+          workflow_id: workflow_id,
+          pipeline_version: updated.pipeline_version,
+          pipeline_fingerprint: updated.pipeline_fingerprint
+        }
+      )
+
+      {:ok, updated}
+    else
+      :not_found -> {:error, :not_found}
+      {:error, _} = error -> error
+      error -> error
+    end
+  end
+
+  @doc """
+  Deletes terminal workflow instances older than a retention cutoff.
+
+  Only `:completed`, `:compensated`, and `:cancelled` rows are eligible.
+  Dependent checkpoints, stage attempts, and effects cascade on delete.
+
+  ## Options
+
+    * `:config` - Interruptus config name atom (default `Interruptus`)
+    * `:older_than` - `%DateTime{}` or age in milliseconds (required)
+    * `:statuses` - subset of terminal statuses (default all three)
+    * `:limit` - max rows per call (default `1000`)
+
+  ## Returns
+
+    * `{:ok, count}` - number of workflow rows deleted
+  """
+  @spec purge_terminal(keyword()) :: {:ok, non_neg_integer()}
+  def purge_terminal(opts \\ []) do
+    config = config_from_opts(opts)
+
+    unless Keyword.has_key?(opts, :older_than) do
+      raise ArgumentError, "Interruptus.purge_terminal/1 requires :older_than"
+    end
+
+    count = Store.purge_terminal(config, opts)
+
+    :telemetry.execute(
+      [:interruptus, :workflow, :purged],
+      %{count: count},
+      %{config: config.name}
+    )
+
+    {:ok, count}
+  end
+
+  @spec require_force(boolean()) :: :ok | {:error, :force_required}
+  defp require_force(true), do: :ok
+  defp require_force(_), do: {:error, :force_required}
+
+  @spec require_suspended(WorkflowInstance.t()) :: :ok | {:error, :not_suspended}
+  defp require_suspended(%WorkflowInstance{status: :suspended}), do: :ok
+  defp require_suspended(_), do: {:error, :not_suspended}
+
+  @spec stringify_keys(term()) :: term()
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), stringify_keys(v)} end)
+  end
+
+  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  defp stringify_keys(other), do: other
+
+  ## Internal ---------------------------------------------------------------
+
+  @spec insert_or_existing(Config.t(), String.t(), String.t() | nil, map()) ::
+          {:ok, WorkflowInstance.t()} | {:error, Ecto.Changeset.t()}
+  defp insert_or_existing(config, workflow_type, idempotency_key, attrs) do
+    case Store.insert_workflow(config, attrs) do
+      {:ok, instance} ->
+        {:ok, instance}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        with true <- idempotency_conflict?(changeset),
+             true <- is_binary(idempotency_key),
+             %WorkflowInstance{} = existing <-
+               Store.get_by_idempotency_key(config, workflow_type, idempotency_key) do
+          {:ok, existing}
+        else
+          _ -> {:error, changeset}
+        end
+    end
+  end
+
+  @spec idempotency_conflict?(Ecto.Changeset.t()) :: boolean()
+  defp idempotency_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn
+      {:idempotency_key, {_, meta}} -> Keyword.get(meta, :constraint) == :unique
+      _ -> false
+    end)
+  end
+
+  @spec prepare_resume(Config.t(), module(), WorkflowInstance.t()) ::
+          {:ok, WorkflowInstance.t()} | {:error, :stale_lock | :not_compensable}
+  defp prepare_resume(config, _workflow_module, %WorkflowInstance{status: :suspended} = instance) do
+    Store.update_with_lock(config, instance, %{
+      status: :pending,
+      suspend_reason: nil,
+      suspend_metadata: nil,
+      attempt_count: 0
+    })
+  end
+
+  defp prepare_resume(config, workflow_module, %WorkflowInstance{status: :failed} = instance) do
+    case Rollback.compensation_plan(workflow_module, instance.current_stage_index) do
+      [] ->
+        {:error, :not_compensable}
+
+      _plan ->
+        Store.update_with_lock(config, instance, %{
+          status: :compensating,
+          attempt_count: 0,
+          locked_by: nil,
+          locked_until: nil
+        })
+    end
+  end
+
+  defp prepare_resume(_config, _workflow_module, instance), do: {:ok, instance}
+
+  @spec do_cancel(Config.t(), Ecto.UUID.t(), boolean(), boolean(), non_neg_integer()) ::
+          {:ok, WorkflowInstance.t()} | {:error, term()}
+  defp do_cancel(_config, _workflow_id, _compensate?, _force?, 0), do: {:error, :stale_lock}
+
+  defp do_cancel(config, workflow_id, compensate?, force?, retries) do
+    case Store.get(config, workflow_id) do
+      nil ->
+        {:error, :not_found}
+
+      %WorkflowInstance{} = instance ->
+        with {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+             :ok <- validate_cancel(instance, workflow_module, compensate?, force?) do
+          if compensate? do
+            cancel_with_compensation(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+          else
+            plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+          end
+        else
+          {:error, :unknown_workflow_type} = err ->
+            # Allow force plain cancel of unresolvable types.
+            if force? and not compensate? do
+              plain_cancel(config, nil, workflow_id, instance, compensate?, force?, retries)
+            else
+              err
+            end
+
+          other ->
+            other
+        end
+    end
+  end
+
+  @spec validate_cancel(WorkflowInstance.t(), module(), boolean(), boolean()) ::
+          :ok | {:error, term()}
+  defp validate_cancel(instance, workflow_module, compensate?, force?) do
+    cond do
+      WorkflowInstance.terminal?(instance) ->
+        {:error, :terminal}
+
+      instance.status == :compensating and not force? ->
+        {:error, :compensation_in_progress}
+
+      not compensate? and not force? ->
+        plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
+
+        if plan == [] do
+          :ok
+        else
+          {:error, :compensation_required}
+        end
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec plain_cancel(
+          Config.t(),
+          module() | nil,
+          Ecto.UUID.t(),
+          WorkflowInstance.t(),
+          boolean(),
+          boolean(),
+          non_neg_integer()
+        ) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  defp plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries) do
+    case Store.update_with_lock(config, instance, %{
+           status: :cancelled,
+           locked_by: nil,
+           locked_until: nil
+         }) do
+      {:ok, cancelled} ->
+        emit_cancelled(workflow_id)
+        maybe_replace_runner(config, workflow_module, workflow_id)
+        {:ok, cancelled}
+
+      {:error, :stale_lock} ->
+        do_cancel(config, workflow_id, compensate?, force?, retries - 1)
+    end
+  end
+
+  @spec cancel_with_compensation(
+          Config.t(),
+          module(),
+          Ecto.UUID.t(),
+          WorkflowInstance.t(),
+          boolean(),
+          boolean(),
+          non_neg_integer()
+        ) ::
+          {:ok, WorkflowInstance.t()} | {:error, term()}
+  defp cancel_with_compensation(
+         config,
+         workflow_module,
+         workflow_id,
+         instance,
+         compensate?,
+         force?,
+         retries
+       ) do
+    plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
+
+    if plan == [] do
+      plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+    else
+      case Store.update_with_lock(config, instance, %{
+             status: :compensating,
+             attempt_count: 0,
+             locked_by: nil,
+             locked_until: nil,
+             errors: Map.put(instance.errors, "cancelled", "true")
+           }) do
+        {:ok, compensating} ->
+          emit_cancelled(workflow_id)
+
+          case RunnerSupervisor.replace_runner(config, workflow_module, workflow_id) do
+            {:ok, _pid} ->
+              {:ok, compensating}
+
+            {:error, reason} ->
+              emit_runner_start_failed(workflow_id, :compensating, reason)
+              {:ok, compensating}
+          end
+
+        {:error, :stale_lock} ->
+          do_cancel(config, workflow_id, compensate?, force?, retries - 1)
+      end
+    end
+  end
+
+  @spec maybe_replace_runner(Config.t(), module() | nil, Ecto.UUID.t()) :: :ok
+  defp maybe_replace_runner(_config, nil, _workflow_id), do: :ok
+
+  defp maybe_replace_runner(config, workflow_module, workflow_id) do
+    # Evict any live runner; do not start a new one for terminal :cancelled.
+    registry = Interruptus.Config.registry_name(config)
+    runner_sup = Interruptus.Config.runner_supervisor_name(config)
+
+    case Registry.lookup(registry, workflow_id) do
+      [{pid, _}] ->
+        _ = DynamicSupervisor.terminate_child(runner_sup, pid)
+        :ok
+
+      [] ->
+        :ok
+    end
+
+    # Silence unused warning when module is only needed for type symmetry.
+    _ = workflow_module
+    :ok
+  end
+
+  @spec emit_runner_start_failed(Ecto.UUID.t(), atom(), term()) :: :ok
+  defp emit_runner_start_failed(workflow_id, status, reason) do
+    :telemetry.execute(
+      [:interruptus, :workflow, :runner_start_failed],
+      %{},
+      %{workflow_id: workflow_id, status: status, reason: reason}
+    )
+  end
+
+  @spec emit_cancelled(Ecto.UUID.t()) :: :ok
+  defp emit_cancelled(workflow_id) do
+    :telemetry.execute(
+      [:interruptus, :workflow, :cancelled],
+      %{},
+      %{workflow_id: workflow_id}
+    )
+  end
+
   @spec config_from_opts(keyword()) :: Config.t()
   defp config_from_opts(opts) do
     opts
@@ -296,10 +862,5 @@ defmodule Interruptus do
     else
       :ok
     end
-  end
-
-  @spec module_from_type(String.t()) :: module()
-  defp module_from_type(type) do
-    type |> String.split(".") |> Module.concat()
   end
 end

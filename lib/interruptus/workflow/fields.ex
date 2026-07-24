@@ -37,23 +37,39 @@ defmodule Interruptus.Workflow.Fields do
     Enum.reduce_while(fields, {:ok, %{}}, fn field, {:ok, acc} ->
       type = schema_mod.__schema__(:type, field)
       key = Atom.to_string(field)
-      value = Map.get(json_map, key) || Map.get(json_map, field)
 
-      case Ecto.Type.load(type, value) do
-        {:ok, loaded} ->
-          {:cont, {:ok, Map.put(acc, field, loaded)}}
+      # Absent keys are omitted so Map.merge(defaults, loaded) keeps declared
+      # defaults. Explicit JSON null still loads as nil and overrides defaults.
+      case fetch_json_value(json_map, key, field) do
+        :absent ->
+          {:cont, {:ok, acc}}
 
-        :error ->
-          {:halt,
-           {:error,
-            CastError.exception(
-              field: field,
-              value: value,
-              operation: :load,
-              reason: :invalid_type
-            )}}
+        {:ok, value} ->
+          case Ecto.Type.load(type, value) do
+            {:ok, loaded} ->
+              {:cont, {:ok, Map.put(acc, field, loaded)}}
+
+            :error ->
+              {:halt,
+               {:error,
+                CastError.exception(
+                  field: field,
+                  value: value,
+                  operation: :load,
+                  reason: :invalid_type
+                )}}
+          end
       end
     end)
+  end
+
+  @spec fetch_json_value(map(), String.t(), atom()) :: :absent | {:ok, term()}
+  defp fetch_json_value(json_map, key, field) do
+    cond do
+      Map.has_key?(json_map, key) -> {:ok, Map.get(json_map, key)}
+      Map.has_key?(json_map, field) -> {:ok, Map.get(json_map, field)}
+      true -> :absent
+    end
   end
 
   @doc """
@@ -93,21 +109,27 @@ defmodule Interruptus.Workflow.Fields do
 
   @doc """
   Normalizes input keys to atoms for changeset casting.
+
+  String keys that do not correspond to an existing atom are **dropped**
+  rather than converted with `String.to_atom/1`: declared workflow fields
+  always have existing atoms, and minting atoms from caller input would allow
+  atom-table exhaustion.
   """
   @spec normalize_input_keys(map() | keyword()) :: map()
   def normalize_input_keys(input) when is_list(input), do: normalize_input_keys(Map.new(input))
 
   def normalize_input_keys(input) when is_map(input) do
-    Map.new(input, fn
-      {k, v} when is_binary(k) ->
+    input
+    |> Enum.reduce(%{}, fn
+      {k, v}, acc when is_binary(k) ->
         try do
-          {String.to_existing_atom(k), v}
+          Map.put(acc, String.to_existing_atom(k), v)
         rescue
-          ArgumentError -> {String.to_atom(k), v}
+          ArgumentError -> acc
         end
 
-      {k, v} ->
-        {k, v}
+      {k, v}, acc ->
+        Map.put(acc, k, v)
     end)
   end
 

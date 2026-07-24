@@ -117,7 +117,7 @@ defmodule Interruptus.ClaimTest do
     assert released.locked_until == nil
   end
 
-  test "lock_version increments only on acquire and never decreases", %{config: config} do
+  test "lock_version bumps on state changes but not on renew", %{config: config} do
     {:ok, instance} =
       Store.insert_workflow(config, %{
         workflow_type: "Test",
@@ -134,17 +134,50 @@ defmodule Interruptus.ClaimTest do
     assert claimed.lock_version == 1
     assert Store.get(config, instance.id).lock_version == 1
 
+    # Renewal is lease maintenance, not a state change: no version bump, so
+    # external fenced writes (cancel/resume) never race the heartbeat.
     assert {:ok, renewed} = Claim.renew(config, claimed)
     assert renewed.lock_version == 1
     assert Store.get(config, instance.id).lock_version == 1
 
+    # Release is a state change (ownership ends): version bumps.
     assert {:ok, released} = Claim.release(config, renewed)
-    assert released.lock_version == 1
-    assert Store.get(config, instance.id).lock_version == 1
+    assert released.lock_version == 2
+    assert Store.get(config, instance.id).lock_version == 2
 
     assert {:ok, reclaimed} = Claim.acquire(config, instance.id)
-    assert reclaimed.lock_version == 2
-    assert Store.get(config, instance.id).lock_version == 2
+    assert reclaimed.lock_version == 3
+    assert Store.get(config, instance.id).lock_version == 3
+  end
+
+  test "acquire preserves :compensating status", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :compensating,
+        params: %{},
+        data: %{},
+        current_stage_index: 1,
+        pipeline_version: 1
+      })
+
+    assert {:ok, claimed} = Claim.acquire(config, instance.id)
+    assert claimed.status == :compensating
+    assert Store.get(config, instance.id).status == :compensating
+  end
+
+  test "suspended workflows are not claimable", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Test",
+        status: :suspended,
+        params: %{},
+        data: %{},
+        current_stage_index: 1,
+        pipeline_version: 1
+      })
+
+    assert {:error, :not_claimable} = Claim.acquire(config, instance.id)
   end
 
   test "re-acquire by another node bumps lock_version and fences stale renew", %{config: config} do

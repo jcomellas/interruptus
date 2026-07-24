@@ -51,8 +51,11 @@ defmodule Interruptus.Workflow do
   ## Stage return values
 
     * Return the updated command struct for normal progress
-    * `{:suspend, reason, metadata}` — voluntary suspension until `Interruptus.resume/2`
-    * `Interruptus.Command.halt/2` — stop forward progress; triggers restart or rollback
+    * `{:suspend, reason, metadata}` — voluntary suspension (pre-stage command)
+    * `Interruptus.Command.suspend/3` — suspension that keeps command mutations
+    * `Interruptus.Command.halt/1` — failure; triggers restart or rollback
+    * `Interruptus.Command.halt(command, success: true)` — durable `:completed`
+    * `{:error, reason}` — structured failure (e.g. effect marker insert failed)
 
   ## Verify functions
 
@@ -79,7 +82,13 @@ defmodule Interruptus.Workflow do
 
   @type raw_segment ::
           {:stage, atom()}
-          | {:checkpoint, %{verify: atom() | nil, pipelines: [atom()]}}
+          | {:checkpoint,
+             %{
+               name: atom() | nil,
+               verify: atom() | nil,
+               pipelines: [atom()],
+               compensate: atom() | nil
+             }}
 
   @doc """
   Imports workflow definition macros into the calling module.
@@ -102,9 +111,11 @@ defmodule Interruptus.Workflow do
       Module.register_attribute(__MODULE__, :workflow_restart_policy, accumulate: false)
       Module.register_attribute(__MODULE__, :workflow_rollback_policy, accumulate: false)
       Module.register_attribute(__MODULE__, :workflow_pipeline_version, accumulate: false)
+      Module.register_attribute(__MODULE__, :workflow_stage_timeout, accumulate: false)
       Module.register_attribute(__MODULE__, :workflow_current_segment, accumulate: false)
 
       @before_compile Interruptus.Workflow
+      @after_compile Interruptus.Workflow
     end
   end
 
@@ -196,13 +207,25 @@ defmodule Interruptus.Workflow do
   end
 
   @doc """
-  Declares a checkpoint segment with optional verify and pipeline stages.
+  Declares a checkpoint segment with optional name, verify, compensation, and
+  pipeline stages.
 
   Checkpoint boundaries define durability: the runner persists state after each
   checkpoint segment completes. Stages inside a checkpoint run at-least-once
-  between checkpoints.
+  between checkpoints. Bare `pipeline` stages outside checkpoints are for pure
+  validate/transform work and are not durable by themselves.
 
   Use `verify/1` inside the block to skip already-applied work.
+
+  ## Options
+
+    * `:name` - explicit segment name for telemetry/status (defaults to the
+      `verify` atom when set, otherwise the first pipeline atom)
+    * `:compensate` - function atom invoked during rollback for this checkpoint
+      when it has been **passed** (snapshot persisted) **or is in-flight**
+      (current `current_stage_index`). Compensations run LIFO, followed by the
+      workflow-level `rollback_policy/1` list. Compensations **must be
+      idempotent**. When `compensate:` is set, `verify/1` is **required**.
 
   ## Examples
 
@@ -210,10 +233,42 @@ defmodule Interruptus.Workflow do
         verify :verify_payment_applied
         pipeline :capture_payment
       end
+
+      checkpoint :debit, compensate: :refund_payment do
+        verify :verify_payment_applied
+        pipeline :capture_payment
+      end
+
+      checkpoint name: :credit, compensate: :reverse_credit do
+        verify :verify_credit
+        pipeline :credit_account
+      end
   """
   defmacro checkpoint(do: block) do
+    build_checkpoint([], block)
+  end
+
+  defmacro checkpoint(name, do: block) when is_atom(name) do
+    build_checkpoint([name: name], block)
+  end
+
+  defmacro checkpoint(opts, do: block) when is_list(opts) do
+    build_checkpoint(opts, block)
+  end
+
+  defmacro checkpoint(name, opts, do: block) when is_atom(name) and is_list(opts) do
+    build_checkpoint(Keyword.put(opts, :name, name), block)
+  end
+
+  @spec build_checkpoint(keyword(), Macro.t()) :: Macro.t()
+  defp build_checkpoint(opts, block) do
     quote do
-      @workflow_current_segment %{verify: nil, pipelines: []}
+      @workflow_current_segment %{
+        name: Keyword.get(unquote(opts), :name),
+        verify: nil,
+        pipelines: [],
+        compensate: Keyword.get(unquote(opts), :compensate)
+      }
       unquote(block)
       Interruptus.Workflow.__checkpoint_segment__(__MODULE__, @workflow_current_segment)
       @workflow_current_segment nil
@@ -274,9 +329,17 @@ defmodule Interruptus.Workflow do
   end
 
   @doc """
-  Sets the pipeline version for migration tracking.
+  Sets the pipeline version for intentional migration tracking.
 
-  Stored on each workflow instance so future pipeline changes can be detected.
+  Stored on each workflow instance and **checked at claim time** together with
+  the automatic `pipeline_fingerprint/0`. When the persisted version differs
+  from the compiled module's version, the runner parks the workflow as
+  `:suspended` with reason `"pipeline_version_mismatch"` instead of executing
+  positional stage indexes against a different pipeline.
+
+  Prefer bumping this when you intentionally change compensation or stage
+  semantics for in-flight instances. Accidental layout edits are also caught by
+  `pipeline_fingerprint/0` even if the version is unchanged.
 
   ## Arguments
 
@@ -285,6 +348,30 @@ defmodule Interruptus.Workflow do
   defmacro pipeline_version(version) do
     quote do
       @workflow_pipeline_version unquote(version)
+    end
+  end
+
+  @doc """
+  Sets the per-stage execution timeout in milliseconds.
+
+  Each pipeline stage (and each compensation function) is aborted with a
+  `:timeout` error when it exceeds this limit, which then flows through the
+  workflow restart policy. Defaults to `:infinity`.
+
+  ## Arguments
+
+    * `timeout` - positive integer in milliseconds, or `:infinity`
+
+  ## Examples
+
+      workflow do
+        stage_timeout 30_000
+        pipeline :call_slow_api
+      end
+  """
+  defmacro stage_timeout(timeout) do
+    quote do
+      @workflow_stage_timeout unquote(timeout)
     end
   end
 
@@ -297,6 +384,7 @@ defmodule Interruptus.Workflow do
     restart_policy = Module.get_attribute(env.module, :workflow_restart_policy) || []
     rollback_policy = Module.get_attribute(env.module, :workflow_rollback_policy) || []
     pipeline_version = Module.get_attribute(env.module, :workflow_pipeline_version) || 1
+    stage_timeout = Module.get_attribute(env.module, :workflow_stage_timeout) || :infinity
 
     param_defaults = param_defaults_map(params)
     data_defaults = data_defaults_map(data)
@@ -305,6 +393,11 @@ defmodule Interruptus.Workflow do
     data_embed = generate_embedded_module(env.module, :Data, data)
 
     flattened = flatten_segments(segments)
+    validate_compensate_requires_verify!(flattened, env)
+    validate_unique_segment_names!(flattened, env)
+
+    normalized_rollback = normalize_rollback_policy(rollback_policy)
+    pipeline_fingerprint = compute_pipeline_fingerprint(flattened, normalized_rollback)
 
     # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
@@ -373,7 +466,7 @@ defmodule Interruptus.Workflow do
       """
       @spec rollback_policy() :: Interruptus.Policy.Rollback.t()
       @impl Interruptus.Workflow.Behaviour
-      def rollback_policy, do: unquote(Macro.escape(normalize_rollback_policy(rollback_policy)))
+      def rollback_policy, do: unquote(Macro.escape(normalized_rollback))
 
       @doc """
       Returns the pipeline version integer stored on new instances.
@@ -381,6 +474,22 @@ defmodule Interruptus.Workflow do
       @spec pipeline_version() :: pos_integer()
       @impl Interruptus.Workflow.Behaviour
       def pipeline_version, do: unquote(pipeline_version)
+
+      @doc """
+      Returns the structural fingerprint of the compiled pipeline layout.
+
+      Compared at claim time against the value persisted on the instance row.
+      """
+      @spec pipeline_fingerprint() :: String.t()
+      @impl Interruptus.Workflow.Behaviour
+      def pipeline_fingerprint, do: unquote(pipeline_fingerprint)
+
+      @doc """
+      Returns the per-stage execution timeout (`:infinity` or milliseconds).
+      """
+      @spec stage_timeout() :: :infinity | pos_integer()
+      @impl Interruptus.Workflow.Behaviour
+      def stage_timeout, do: unquote(stage_timeout)
 
       @doc """
       Casts parameters and returns an atom-keyed params map.
@@ -488,6 +597,7 @@ defmodule Interruptus.Workflow do
               t()
               | {:suspend, term(), map(), t()}
               | {:error, term()}
+              | {:error, term(), t()}
       def run(%__MODULE__{pipelines: pipelines} = command) do
         pipelines
         |> Enum.reduce_while(command, fn segment, acc ->
@@ -495,14 +605,28 @@ defmodule Interruptus.Workflow do
             {:ok, updated} -> {:cont, updated}
             {:halted, halted} -> {:halt, halted}
             {:suspend, _, _, _} = suspended -> {:halt, suspended}
+            {:error, _, _} = err -> {:halt, err}
             {:error, _} = err -> {:halt, err}
           end
         end)
         |> case do
-          {:suspend, _, _, _} = suspended -> suspended
-          {:error, _} = err -> err
-          %{halted: true} = halted -> halted
-          command -> Interruptus.Command.maybe_mark_successful(command)
+          {:suspend, _, _, _} = suspended ->
+            suspended
+
+          {:error, _, _} = err ->
+            err
+
+          {:error, _} = err ->
+            err
+
+          %{halted: true, success: true} = halted ->
+            Interruptus.Command.maybe_mark_successful(%{halted | halted: false})
+
+          %{halted: true} = halted ->
+            halted
+
+          command ->
+            Interruptus.Command.maybe_mark_successful(command)
         end
       end
 
@@ -678,11 +802,130 @@ defmodule Interruptus.Workflow do
   defp flatten_segments(segments) do
     Enum.flat_map(segments, fn
       {:stage, name} ->
-        [%{type: :stage, name: name, verify: nil, pipelines: [name]}]
+        [%{type: :stage, name: name, verify: nil, pipelines: [name], compensate: nil}]
 
       {:checkpoint, segment} ->
-        [%{type: :checkpoint, verify: segment.verify, pipelines: segment.pipelines}]
+        [
+          %{
+            type: :checkpoint,
+            name: checkpoint_name(segment),
+            verify: segment.verify,
+            pipelines: segment.pipelines,
+            compensate: Map.get(segment, :compensate)
+          }
+        ]
     end)
+  end
+
+  @spec checkpoint_name(map()) :: atom() | nil
+  defp checkpoint_name(segment) do
+    cond do
+      match?(%{name: name} when is_atom(name) and not is_nil(name), segment) ->
+        segment.name
+
+      is_atom(segment.verify) and not is_nil(segment.verify) ->
+        segment.verify
+
+      true ->
+        List.first(segment.pipelines)
+    end
+  end
+
+  @spec validate_compensate_requires_verify!([segment()], Macro.Env.t()) :: :ok
+  defp validate_compensate_requires_verify!(flattened, env) do
+    Enum.each(flattened, fn
+      %{type: :checkpoint, compensate: compensate, verify: nil} when not is_nil(compensate) ->
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description:
+            "checkpoint with compensate: #{inspect(compensate)} requires verify/1 " <>
+              "(compensations are tentative for in-flight segments and must reconcile via verify)"
+
+      _ ->
+        :ok
+    end)
+  end
+
+  @spec validate_unique_segment_names!([segment()], Macro.Env.t()) :: :ok
+  defp validate_unique_segment_names!(flattened, env) do
+    names =
+      flattened
+      |> Enum.map(& &1.name)
+      |> Enum.reject(&is_nil/1)
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        :ok
+
+      duplicates ->
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description:
+            "duplicate workflow segment names: #{inspect(Enum.uniq(duplicates))} " <>
+              "(use checkpoint :name do ... end to disambiguate)"
+    end
+  end
+
+  @spec compute_pipeline_fingerprint([segment()], Interruptus.Policy.Rollback.t()) :: String.t()
+  defp compute_pipeline_fingerprint(flattened, rollback_policy) do
+    canonical = {
+      Enum.map(flattened, fn seg ->
+        {seg.type, seg.name, seg.verify, seg.pipelines, seg.compensate}
+      end),
+      rollback_policy.compensate
+    }
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(canonical))
+    |> Base.encode16(case: :lower)
+  end
+
+  # Validates stage/verify/compensate callbacks exist after the module is compiled.
+  @doc false
+  @spec __after_compile__(Macro.Env.t(), binary()) :: :ok
+  def __after_compile__(env, _bytecode) do
+    mod = env.module
+    flattened = mod.flattened_pipelines()
+    rollback = mod.rollback_policy()
+
+    for %{pipelines: pipelines} <- flattened, name <- pipelines do
+      unless function_exported?(mod, name, 1) or function_exported?(mod, name, 3) do
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description: "#{inspect(mod)} is missing stage function #{name}/1 or #{name}/3"
+      end
+    end
+
+    for %{verify: verify} <- flattened, is_atom(verify) and not is_nil(verify) do
+      unless function_exported?(mod, verify, 1) do
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description: "#{inspect(mod)} is missing verify function #{verify}/1"
+      end
+    end
+
+    for %{compensate: compensate} <- flattened, is_atom(compensate) and not is_nil(compensate) do
+      unless function_exported?(mod, compensate, 1) do
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description: "#{inspect(mod)} is missing compensate function #{compensate}/1"
+      end
+    end
+
+    for name <- rollback.compensate do
+      unless function_exported?(mod, name, 1) do
+        raise CompileError,
+          file: env.file,
+          line: env.line,
+          description: "#{inspect(mod)} is missing rollback compensate function #{name}/1"
+      end
+    end
+
+    :ok
   end
 
   @spec normalize_restart_policy(keyword() | []) :: Interruptus.Policy.Restart.t()
@@ -738,6 +981,14 @@ defmodule Interruptus.Workflow.Behaviour do
   ### `pipeline_version/0`
 
   Returns the positive integer pipeline version for instance rows.
+
+  ### `pipeline_fingerprint/0`
+
+  Returns the structural fingerprint of the compiled pipeline (SHA-256 hex).
+
+  ### `stage_timeout/0`
+
+  Returns the per-stage execution timeout (`:infinity` or milliseconds).
   """
 
   @callback workflow_type() :: module()
@@ -746,6 +997,8 @@ defmodule Interruptus.Workflow.Behaviour do
   @callback restart_policy() :: Interruptus.Policy.Restart.t()
   @callback rollback_policy() :: Interruptus.Policy.Rollback.t()
   @callback pipeline_version() :: pos_integer()
+  @callback pipeline_fingerprint() :: String.t()
+  @callback stage_timeout() :: :infinity | pos_integer()
   @callback cast_params(map() | keyword()) :: {:ok, map()} | {:error, Ecto.Changeset.t()}
   @callback load_params(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
   @callback load_data(map()) :: {:ok, map()} | {:error, Interruptus.Workflow.CastError.t()}
@@ -763,15 +1016,18 @@ defmodule Interruptus.Workflow.Segment do
   ## Fields
 
     * `:type` - `:stage` for a single pipeline, `:checkpoint` for a durable segment
-    * `:name` - stage name for `:stage` segments, otherwise `nil`
+    * `:name` - stage function atom, or checkpoint name (explicit override, else
+      verify atom, else first pipeline atom)
     * `:verify` - verify function atom for checkpoints, otherwise `nil`
     * `:pipelines` - ordered list of pipeline function atoms to run
+    * `:compensate` - compensation function atom for checkpoints, otherwise `nil`
   """
 
   @type t :: %{
           type: :stage | :checkpoint,
           name: atom() | nil,
           verify: atom() | nil,
-          pipelines: [atom()]
+          pipelines: [atom()],
+          compensate: atom() | nil
         }
 end

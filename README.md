@@ -2,6 +2,8 @@
 
 Durable workflow pipelines for Elixir with typed params/data, checkpoint-based persistence, multi-node exclusivity, and explicit suspend/resume.
 
+**Read the [user guide](GUIDE.md)** for design tradeoffs, concepts, compilable examples, and internals. See [DESIGN.md](DESIGN.md) for architecture detail.
+
 ## Installation
 
 ```elixir
@@ -16,12 +18,16 @@ end
 
 ```elixir
 # config/config.exs
-config :my_app, Interruptus,
+config :interruptus, Interruptus,
   repo: MyApp.Repo,
   prefix: "public",
-  node_id: "node-1",
   lease_duration: 30_000,
-  heartbeat_interval: 10_000
+  heartbeat_interval: 10_000,
+  recovery_interval: 5_000
+
+# :node_id defaults to "#{Node.self()}/<random-boot-token>", which is safe for
+# multi-node deployments even without distributed Erlang. Set it explicitly if
+# you want stable lease attribution across restarts.
 
 # application.ex — shared repo (simple) or dedicated pool (recommended under load)
 children = [
@@ -64,21 +70,79 @@ defmodule MyApp.TransferFunds do
     param :amount, :decimal
 
     data :debit_ref, :string
+    data :credit_ref, :string
+
+    stage_timeout 30_000
 
     pipeline :validate
 
-    checkpoint do
+    # Per-checkpoint compensations (preferred): LIFO over passed **and
+    # in-flight** checkpoints. `verify` is required when `compensate:` is set.
+    # Compensations must be idempotent. Bare `pipeline` stages are for pure
+    # validate/transform work; checkpoints bound side effects.
+    # Names default to the verify atom (or first pipeline); override with
+    # `checkpoint :debit do` when needed for telemetry/status.
+    checkpoint :debit, compensate: :reverse_debit do
       verify :verify_debit
       pipeline :debit_account
     end
 
+    checkpoint :credit, compensate: :reverse_credit do
+      verify :verify_credit
+      pipeline :credit_account
+    end
+
     restart_policy max_attempts: 3, backoff: :exponential
-    rollback_policy compensate: [:reverse_debit]
   end
 end
 
-{:ok, workflow} = Interruptus.start(MyApp.TransferFunds, %{from_account_id: 1, amount: "100.00"})
+# Idempotent start: retrying with the same key returns the existing instance.
+{:ok, workflow} =
+  Interruptus.start(MyApp.TransferFunds, %{from_account_id: 1, amount: "100.00"},
+    idempotency_key: "transfer-1234"
+  )
 ```
+
+## Lifecycle semantics
+
+- **Retries are bounded across crashes** — `attempt_count` is persisted *before*
+  each execution attempt, so a crash-looping workflow ends in rollback after
+  `max_attempts`, never in an infinite reclaim loop. Raised exceptions, throws,
+  exits, timeouts, and `halt/1` all flow through the restart policy.
+  `halt(command, success: true)` is a durable early exit to `:completed`
+  (no compensation).
+- **Suspension is explicit** — a `:suspended` workflow is never auto-resumed by
+  recovery. `Interruptus.resume/2` performs a fenced `suspended → pending`
+  transition. `Interruptus.signal/3` merges a payload into
+  `suspend_metadata["signal"]` then resumes the same way (HITL / external
+  callbacks). A `:failed` workflow with a non-empty compensation plan resumes
+  into `:compensating`; an empty plan returns `{:error, :not_compensable}` and
+  stays `:failed`.
+- **Compensation is durable** — `compensation_index` is persisted after each
+  compensation function; a crash mid-rollback is reclaimed and resumes from the
+  last completed step. Compensations run for **passed and in-flight** checkpoints
+  (plus any workflow-level `rollback_policy` list) and must be idempotent.
+  Entering compensation persists the current command snapshot so reclaim sees
+  the same data.
+- **Cancel defaults to compensate** — `Interruptus.cancel/2` bumps the fencing
+  token, **always evicts** any registered runner, and defaults to
+  `compensate: true`. Prefer intent helpers: `Interruptus.compensate/2` (same
+  default), `Interruptus.abandon/2` (plain cancel with `force: true`), and
+  `Interruptus.retry_compensation/2` (resume only `:failed` workflows).
+  Plain cancel with a non-empty plan requires `force: true`. Cancel while
+  `:compensating` requires `force: true`.
+- **Long stages and verify are safe** — lease heartbeats renew concurrently with
+  segment tasks; `stage_timeout` applies to both stages and `verify/1`.
+- **Start is durable first** — if the workflow row commits but the runner cannot
+  start immediately, `start/3` still returns `{:ok, instance}`; Recovery reclaims
+  lease-less `:pending` rows.
+- **Deploy skew is detected** — mismatched `pipeline_version` or automatic
+  `pipeline_fingerprint` parks the instance as `:suspended`. Unresolvable
+  `workflow_type` rows are parked as `:suspended` (`"unknown_workflow_type"`)
+  so they cannot starve reclaim.
+- **Suspend with mutations** — prefer `Command.suspend(command, reason, metadata)`
+  (4-tuple) when the stage has already updated `data`/`params`; the 3-tuple
+  `{:suspend, reason, metadata}` keeps the pre-stage command.
 
 ## Durability and the database
 
@@ -86,8 +150,30 @@ Interruptus persists workflow state in the host application's PostgreSQL databas
 
 - Stage DB writes and checkpoint writes are **independent commits** — not one atomic unit.
 - Segments between checkpoints may run **at-least-once** after a crash; use idempotent side effects, domain unique constraints, and checkpoint `verify/1`.
-- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay.
-- `lock_version` fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry.
+- `Interruptus.Effect.once/4` **claims** a `(workflow_id, effect_key)` marker as
+  `:pending` before running work, then marks `:applied` on success (or deletes
+  pending on halt/suspend/error). Prefer `Effect.exists?/3` in `verify/1` and
+  `Effect.once/4` in the stage, with stable keys from `Effect.key/1`:
+
+      def verify_debit(command) do
+        if Effect.exists?(command, Effect.key(["debit", command.params.ref])),
+          do: :done,
+          else: :not_done
+      end
+
+      def debit_account(command, params, _data) do
+        Effect.once(command, Effect.key(["debit", params.ref]), fn cmd ->
+          # apply side effect
+          cmd
+        end)
+      end
+
+  `exists?/3` is true only for `:applied`. Stale pending markers (older than
+  the lease duration) may be reclaimed. Concurrent callers serialize on the
+  unique key; domain unique constraints are still required for hard once-only
+  guarantees against external systems. In tests, use
+  `Interruptus.Test.assign_workflow_id/2` so in-memory commands can touch markers.
+- `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry. In-flight external side effects may still complete after a fence until the process exits.
 
 ### Do not nest API calls in transactions
 
@@ -107,7 +193,14 @@ children = [
 ]
 ```
 
-See [DESIGN.md](DESIGN.md) for architecture details and [AGENTS.md](AGENTS.md) for contributor context.
+See [GUIDE.md](GUIDE.md) for the full user guide, [DESIGN.md](DESIGN.md) for architecture details, and [AGENTS.md](AGENTS.md) for contributor context.
+
+## Retention
+
+Call `Interruptus.purge_terminal/1` from a host cron/Oban job to delete old
+`:completed` / `:compensated` / `:cancelled` rows (children cascade). To purge
+during Recovery scans, set `retention_ms` and `purge_schedule: true` in config
+(both default off).
 
 ## License
 

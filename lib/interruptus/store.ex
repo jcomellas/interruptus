@@ -4,6 +4,21 @@ defmodule Interruptus.Store do
 
   All functions take an `Interruptus.Config` as the first argument and operate
   through `Interruptus.Repo` against the host application's database.
+
+  ## Fencing
+
+  Every state-changing write goes through optimistic locking on `lock_version`
+  and **increments the version**, so any process holding a stale snapshot of
+  the row is fenced out on its next write:
+
+    * `update_with_lock/3` — version check + bump. Used by API-side writes
+      (`Interruptus.cancel/2`, `Interruptus.resume/2`) and lease release.
+    * `update_as_holder/4` — version check + bump, additionally guarded by
+      `locked_by = node_id AND locked_until > now()`. Used for all
+      runner-originated writes so an expired-lease runner cannot write even
+      before another node re-claims the row.
+    * `checkpoint_progress/4` — `update_as_holder/4` plus checkpoint audit
+      insert in a single transaction.
   """
 
   import Ecto.Query
@@ -65,10 +80,39 @@ defmodule Interruptus.Store do
   end
 
   @doc """
+  Fetches a workflow by `workflow_type` and `idempotency_key`.
+
+  Used to return the existing instance when `Interruptus.start/3` hits the
+  idempotency unique index.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `workflow_type` - workflow type string
+    * `idempotency_key` - idempotency key string
+
+  ## Returns
+
+    * `%WorkflowInstance{}` when found
+    * `nil` when no row exists
+  """
+  @spec get_by_idempotency_key(Config.t(), String.t(), String.t()) ::
+          WorkflowInstance.t() | nil
+  def get_by_idempotency_key(config, workflow_type, idempotency_key) do
+    Repo.one(
+      config,
+      from(w in WorkflowInstance,
+        where: w.workflow_type == ^workflow_type and w.idempotency_key == ^idempotency_key
+      )
+    )
+  end
+
+  @doc """
   Updates workflow fields with optimistic locking on `lock_version`.
 
   The update succeeds only when the row's `lock_version` matches the instance
-  passed in. On success, `lock_version` is incremented automatically.
+  passed in. On success, `lock_version` is incremented (fencing token) and the
+  freshly loaded row is returned.
 
   ## Arguments
 
@@ -85,13 +129,61 @@ defmodule Interruptus.Store do
           {:ok, WorkflowInstance.t()} | {:error, :stale_lock | Ecto.Changeset.t()}
   def update_with_lock(config, %WorkflowInstance{id: id, lock_version: version}, attrs) do
     now = DateTime.utc_now()
-    set_fields = build_set_fields(attrs, now)
+    set_fields = build_set_fields(attrs, version, now)
 
     {count, _} =
       Repo.update_all(
         config,
         from(w in WorkflowInstance,
           where: w.id == ^id and w.lock_version == ^version
+        ),
+        set: set_fields
+      )
+
+    case count do
+      1 -> {:ok, get!(config, id)}
+      0 -> {:error, :stale_lock}
+    end
+  end
+
+  @doc """
+  Updates workflow fields as the current lease holder.
+
+  Like `update_with_lock/3` but additionally requires the row to be held by
+  `node_id` with an unexpired lease. All runner-originated writes must use this
+  function so a runner whose lease expired (or was fenced by `cancel`/`resume`)
+  cannot mutate the row.
+
+  ## Arguments
+
+    * `config` - Interruptus config
+    * `instance` - instance with current `id` and `lock_version`
+    * `node_id` - the writing node; must match `locked_by`
+    * `attrs` - map of fields to update
+
+  ## Returns
+
+    * `{:ok, %WorkflowInstance{}}` - freshly loaded row after update
+    * `{:error, :stale_lock}` - version mismatch, foreign holder, or expired lease
+  """
+  @spec update_as_holder(
+          Config.t(),
+          WorkflowInstance.t() | WorkflowInstance.lock_ref(),
+          String.t(),
+          map()
+        ) ::
+          {:ok, WorkflowInstance.t()} | {:error, :stale_lock}
+  def update_as_holder(config, %WorkflowInstance{id: id, lock_version: version}, node_id, attrs) do
+    now = DateTime.utc_now()
+    set_fields = build_set_fields(attrs, version, now)
+
+    {count, _} =
+      Repo.update_all(
+        config,
+        from(w in WorkflowInstance,
+          where:
+            w.id == ^id and w.lock_version == ^version and w.locked_by == ^node_id and
+              w.locked_until > ^now
         ),
         set: set_fields
       )
@@ -127,34 +219,38 @@ defmodule Interruptus.Store do
   @doc """
   Atomically advances workflow progress and writes a checkpoint audit row.
 
-  Runs the optimistic lock update and checkpoint insert in a single transaction
-  so the instance row and audit trail cannot diverge mid-crash.
+  Runs the holder-guarded optimistic lock update and checkpoint insert in a
+  single transaction so the instance row and audit trail cannot diverge
+  mid-crash. Only the current lease holder may checkpoint.
 
   ## Arguments
 
     * `config` - Interruptus config
     * `instance` - instance with current `id` and `lock_version`
+    * `node_id` - the writing node; must match `locked_by`
     * `attrs` - fields to update on the workflow row (typically `params`, `data`,
-      `current_stage_index`, `errors`)
+      `current_stage_index`, `attempt_count`, `errors`)
 
   ## Returns
 
     * `{:ok, %WorkflowInstance{}}` - freshly loaded row after update
-    * `{:error, :stale_lock}` - another process updated the row first
+    * `{:error, :stale_lock}` - version mismatch, foreign holder, or expired lease
     * `{:error, %Ecto.Changeset{}}` - checkpoint insert validation failure
   """
-  @spec checkpoint_progress(Config.t(), WorkflowInstance.t(), map()) ::
+  @spec checkpoint_progress(Config.t(), WorkflowInstance.t(), String.t(), map()) ::
           {:ok, WorkflowInstance.t()} | {:error, :stale_lock | Ecto.Changeset.t()}
-  def checkpoint_progress(config, %WorkflowInstance{id: id, lock_version: version}, attrs) do
+  def checkpoint_progress(config, %WorkflowInstance{id: id, lock_version: version}, node_id, attrs) do
     now = DateTime.utc_now()
-    set_fields = build_set_fields(attrs, now)
+    set_fields = build_set_fields(attrs, version, now)
 
     Repo.transaction(config, fn ->
       {count, _} =
         Repo.update_all(
           config,
           from(w in WorkflowInstance,
-            where: w.id == ^id and w.lock_version == ^version
+            where:
+              w.id == ^id and w.lock_version == ^version and w.locked_by == ^node_id and
+                w.locked_until > ^now
           ),
           set: set_fields
         )
@@ -206,36 +302,165 @@ defmodule Interruptus.Store do
   @doc """
   Lists workflows that are reclaimable after lease expiry.
 
-  Returns non-terminal workflows (`:pending`, `:suspended`, `:running`) whose
-  `locked_until` is `nil` or in the past. Used by `Interruptus.Recovery`.
+  Returns `:pending`, `:running`, and `:compensating` workflows whose
+  `locked_until` is `nil` or in the past. `:suspended` workflows are **not**
+  reclaimable — they require an explicit `Interruptus.resume/2`. Used by
+  `Interruptus.Recovery`.
 
   ## Arguments
 
     * `config` - Interruptus config
     * `now` - reference time for lease comparison (default `DateTime.utc_now/0`)
+    * `opts` - pagination options
+
+  ## Options
+
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` cursor for keyset pagination (exclusive)
 
   ## Returns
 
-    * List of `%WorkflowInstance{}`, ordered by `inserted_at`, limited to 100 rows
+    * List of `%WorkflowInstance{}`, ordered by `inserted_at`, `id`
   """
-  @spec list_reclaimable(Config.t(), DateTime.t()) :: [WorkflowInstance.t()]
-  def list_reclaimable(config, now \\ DateTime.utc_now()) do
-    Repo.all(
-      config,
+  @spec list_reclaimable(Config.t(), DateTime.t(), keyword()) :: [WorkflowInstance.t()]
+  def list_reclaimable(config, now \\ DateTime.utc_now(), opts \\ []) do
+    statuses = WorkflowInstance.claimable_statuses()
+    limit = Keyword.get(opts, :limit, 100)
+    after_cursor = Keyword.get(opts, :after)
+
+    query =
       from(w in WorkflowInstance,
         where:
-          w.status in [:pending, :suspended, :running] and
+          w.status in ^statuses and
             (is_nil(w.locked_until) or w.locked_until < ^now),
-        order_by: [asc: w.inserted_at],
-        limit: 100
+        order_by: [asc: w.inserted_at, asc: w.id],
+        limit: ^limit
       )
-    )
+
+    query =
+      case after_cursor do
+        {inserted_at, id} ->
+          from(w in query,
+            where:
+              w.inserted_at > ^inserted_at or
+                (w.inserted_at == ^inserted_at and w.id > ^id)
+          )
+
+        nil ->
+          query
+      end
+
+    Repo.all(config, query)
   end
 
-  @spec build_set_fields(map(), DateTime.t()) :: [{atom(), term()}]
-  defp build_set_fields(attrs, now) do
+  @parked_reasons ~w(
+    pipeline_fingerprint_mismatch
+    pipeline_version_mismatch
+    unknown_workflow_type
+  )
+
+  @doc """
+  Lists `:suspended` workflows parked for deploy/identity reasons.
+
+  ## Options
+
+    * `:limit` - page size (default `100`)
+    * `:after` - `{inserted_at, id}` cursor for keyset pagination (exclusive)
+    * `:reasons` - suspend reasons to include (default identity-mismatch set)
+  """
+  @spec list_parked(Config.t(), keyword()) :: [WorkflowInstance.t()]
+  def list_parked(config, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 100)
+    after_cursor = Keyword.get(opts, :after)
+    reasons = Keyword.get(opts, :reasons, @parked_reasons)
+
+    query =
+      from(w in WorkflowInstance,
+        where: w.status == :suspended and w.suspend_reason in ^reasons,
+        order_by: [asc: w.inserted_at, asc: w.id],
+        limit: ^limit
+      )
+
+    query =
+      case after_cursor do
+        {inserted_at, id} ->
+          from(w in query,
+            where:
+              w.inserted_at > ^inserted_at or
+                (w.inserted_at == ^inserted_at and w.id > ^id)
+          )
+
+        nil ->
+          query
+      end
+
+    Repo.all(config, query)
+  end
+
+  @doc false
+  @spec parked_reasons() :: [String.t()]
+  def parked_reasons, do: @parked_reasons
+
+  @terminal_statuses [:completed, :compensated, :cancelled]
+
+  @doc """
+  Deletes terminal workflow rows older than the given cutoff.
+
+  Child checkpoint/attempt/effect rows cascade via FK `on_delete: :delete_all`.
+
+  ## Options
+
+    * `:older_than` - `%DateTime{}` cutoff, or age in milliseconds relative to now
+    * `:statuses` - terminal statuses to purge (default completed/compensated/cancelled)
+    * `:limit` - max rows to delete (default `1000`)
+  """
+  @spec purge_terminal(Config.t(), keyword()) :: non_neg_integer()
+  def purge_terminal(config, opts \\ []) do
+    older_than = purge_cutoff(Keyword.fetch!(opts, :older_than))
+    statuses = Keyword.get(opts, :statuses, @terminal_statuses)
+    limit = Keyword.get(opts, :limit, 1000)
+
+    unless Enum.all?(statuses, &(&1 in @terminal_statuses)) do
+      raise ArgumentError,
+            "purge_terminal statuses must be terminal (got #{inspect(statuses)})"
+    end
+
+    ids =
+      Repo.all(
+        config,
+        from(w in WorkflowInstance,
+          where: w.status in ^statuses and w.updated_at < ^older_than,
+          order_by: [asc: w.updated_at, asc: w.id],
+          select: w.id,
+          limit: ^limit
+        )
+      )
+
+    case ids do
+      [] ->
+        0
+
+      ids ->
+        {count, _} =
+          Repo.delete_all(config, from(w in WorkflowInstance, where: w.id in ^ids))
+
+        count
+    end
+  end
+
+  @spec purge_cutoff(DateTime.t() | pos_integer()) :: DateTime.t()
+  defp purge_cutoff(%DateTime{} = dt), do: dt
+
+  defp purge_cutoff(ms) when is_integer(ms) and ms > 0 do
+    DateTime.add(DateTime.utc_now(), -ms, :millisecond)
+  end
+
+  @spec build_set_fields(map(), non_neg_integer(), DateTime.t()) :: [{atom(), term()}]
+  defp build_set_fields(attrs, current_version, now) do
     attrs
+    |> Map.drop([:lock_version])
     |> Map.put(:updated_at, now)
+    |> Map.put(:lock_version, current_version + 1)
     |> Enum.map(fn {k, v} -> {k, v} end)
   end
 

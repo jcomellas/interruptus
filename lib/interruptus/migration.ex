@@ -22,7 +22,7 @@ defmodule Interruptus.Migration do
 
   use Ecto.Migration
 
-  @current_version 2
+  @current_version 5
 
   @doc """
   Runs all Interruptus migrations up to the current version.
@@ -83,6 +83,9 @@ defmodule Interruptus.Migration do
     prefix = Keyword.get(opts, :prefix)
 
     cond do
+      column_exists?("interruptus_workflows", "pipeline_fingerprint", prefix) -> 5
+      constraint_exists?("interruptus_workflows_status_check", prefix) -> 4
+      column_exists?("interruptus_workflows", "compensation_index", prefix) -> 3
       table_exists?("interruptus_effects", prefix) -> 2
       table_exists?("interruptus_workflows", prefix) -> 1
       true -> 0
@@ -92,6 +95,42 @@ defmodule Interruptus.Migration do
   @spec table_exists?(String.t(), String.t() | nil) :: boolean()
   defp table_exists?(table, prefix) do
     Ecto.Adapters.SQL.table_exists?(repo(), table, prefix: prefix)
+  rescue
+    _ -> false
+  end
+
+  @spec column_exists?(String.t(), String.t(), String.t() | nil) :: boolean()
+  defp column_exists?(table, column, prefix) do
+    schema = prefix || "public"
+
+    %{rows: rows} =
+      repo().query!(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        """,
+        [schema, table, column]
+      )
+
+    rows != []
+  rescue
+    _ -> false
+  end
+
+  @spec constraint_exists?(String.t(), String.t() | nil) :: boolean()
+  defp constraint_exists?(constraint_name, prefix) do
+    schema = prefix || "public"
+
+    %{rows: rows} =
+      repo().query!(
+        """
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = $1 AND constraint_name = $2
+        """,
+        [schema, constraint_name]
+      )
+
+    rows != []
   rescue
     _ -> false
   end
@@ -235,6 +274,80 @@ defmodule Interruptus.Migration do
     :ok
   end
 
+  # Version 3 migration: durable compensation progress tracking.
+  @doc false
+  @spec up3(keyword()) :: :ok
+  def up3(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      add_if_not_exists :compensation_index, :integer, null: false, default: 0
+    end
+
+    :ok
+  end
+
+  # Version 3 rollback: drops compensation_index.
+  @doc false
+  @spec down3(keyword()) :: :ok
+  def down3(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      remove_if_exists :compensation_index, :integer
+    end
+
+    :ok
+  end
+
+  # Version 4 migration: CHECK constraint on workflow status + non-negative counters.
+  @doc false
+  @spec up4(keyword()) :: :ok
+  def up4(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_workflows
+    ADD CONSTRAINT interruptus_workflows_status_check
+    CHECK (status IN (
+      'pending', 'running', 'suspended', 'completed', 'failed',
+      'compensating', 'compensated', 'cancelled'
+    ))
+    """)
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_workflows
+    ADD CONSTRAINT interruptus_workflows_nonneg_check
+    CHECK (
+      current_stage_index >= 0 AND
+      lock_version >= 0 AND
+      attempt_count >= 0 AND
+      compensation_index >= 0
+    )
+    """)
+
+    :ok
+  end
+
+  # Version 4 rollback: drops CHECK constraints.
+  @doc false
+  @spec down4(keyword()) :: :ok
+  def down4(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_workflows DROP CONSTRAINT IF EXISTS interruptus_workflows_nonneg_check"
+    )
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_workflows DROP CONSTRAINT IF EXISTS interruptus_workflows_status_check"
+    )
+
+    :ok
+  end
+
   # Version 2 rollback: drops interruptus_effects.
   @doc false
   @spec down2(keyword()) :: :ok
@@ -249,6 +362,54 @@ defmodule Interruptus.Migration do
     )
 
     drop_if_exists table(:interruptus_effects, prefix: prefix)
+
+    :ok
+  end
+
+  # Version 5 migration: effect pending/applied status + pipeline fingerprint.
+  @doc false
+  @spec up5(keyword()) :: :ok
+  def up5(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      add_if_not_exists :pipeline_fingerprint, :string, null: false, default: ""
+    end
+
+    alter table(:interruptus_effects, prefix: prefix) do
+      add_if_not_exists :status, :string, null: false, default: "applied"
+      add_if_not_exists :updated_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    end
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_effects
+    ADD CONSTRAINT interruptus_effects_status_check
+    CHECK (status IN ('pending', 'applied'))
+    """)
+
+    :ok
+  end
+
+  # Version 5 rollback: drops fingerprint and effect status columns.
+  @doc false
+  @spec down5(keyword()) :: :ok
+  def down5(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_effects DROP CONSTRAINT IF EXISTS interruptus_effects_status_check"
+    )
+
+    alter table(:interruptus_effects, prefix: prefix) do
+      remove_if_exists :updated_at, :utc_datetime_usec
+      remove_if_exists :status, :string
+    end
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      remove_if_exists :pipeline_fingerprint, :string
+    end
 
     :ok
   end

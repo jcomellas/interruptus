@@ -23,7 +23,7 @@ defmodule Interruptus.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :telemetry],
+      extra_applications: [:logger, :telemetry, :crypto],
       mod: {Interruptus.Application, []}
     ]
   end
@@ -73,7 +73,7 @@ defmodule Interruptus.MixProject do
   defp package do
     [
       name: "interruptus",
-      files: ~w(lib mix.exs README.md LICENSE .formatter.exs),
+      files: ~w(lib mix.exs README.md GUIDE.md LICENSE .formatter.exs),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}
     ]
@@ -82,7 +82,7 @@ defmodule Interruptus.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "DESIGN.md", "AGENTS.md"],
+      extras: ["README.md", "GUIDE.md", "DESIGN.md", "AGENTS.md"],
       source_url: @source_url
     ]
   end

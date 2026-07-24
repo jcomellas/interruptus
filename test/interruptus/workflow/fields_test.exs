@@ -37,7 +37,18 @@ defmodule Interruptus.Workflow.FieldsTest do
 
       assert {:ok, loaded} = TypedFields.load_data(dumped)
       assert loaded.name == "alice"
-      assert loaded.count == nil
+      refute Map.has_key?(loaded, :count)
+    end
+
+    test "absent JSON keys are omitted so defaults can merge" do
+      assert {:ok, loaded} = TypedFields.load_data(%{})
+      assert loaded == %{}
+    end
+
+    test "explicit JSON null loads as nil" do
+      assert {:ok, loaded} = TypedFields.load_data(%{"flag" => nil, "name" => "x"})
+      assert loaded.flag == nil
+      assert loaded.name == "x"
     end
 
     test "dump_data rejects values that fail dump validation" do
@@ -48,6 +59,35 @@ defmodule Interruptus.Workflow.FieldsTest do
     test "load_params fails on invalid stored value" do
       assert {:error, %CastError{field: :required_int, operation: :load}} =
                TypedFields.load_params(%{"required_int" => "not-a-number", "amount" => "1"})
+    end
+
+    test "boolean false round-trips through dump and load" do
+      assert {:ok, dumped} = TypedFields.dump_data(%{name: "n", count: nil, flag: false})
+      assert dumped == %{"name" => "n", "flag" => false}
+
+      assert {:ok, loaded} = TypedFields.load_data(dumped)
+      assert loaded.flag == false
+
+      assert {:ok, loaded_true} = TypedFields.load_data(%{"flag" => true})
+      assert loaded_true.flag == true
+    end
+  end
+
+  describe "input key safety" do
+    test "unknown string param keys are dropped without minting atoms" do
+      unknown_key = "definitely_not_an_atom_#{System.unique_integer([:positive])}"
+
+      assert {:ok, params} =
+               TypedFields.cast_params(%{
+                 "required_int" => "5",
+                 "amount" => "1",
+                 unknown_key => "ignored"
+               })
+
+      assert params.required_int == 5
+
+      # The unknown key must not have been converted to an atom.
+      assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_key) end
     end
   end
 

@@ -13,10 +13,29 @@ defmodule Interruptus.Config do
     * `:repo` - host Ecto repo module used for Interruptus persistence (required).
       May be the application Repo or a dedicated pool Repo pointing at the same database.
     * `:prefix` - PostgreSQL schema prefix (default `"public"`)
-    * `:node_id` - cluster node identifier for leases (defaults to `Node.self/0` as string)
+    * `:node_id` - cluster node identifier for leases. Defaults to
+      `"#{Node.self()}/<boot-token>"` where the boot token is random per VM
+      start, so non-distributed nodes (all named `nonode@nohost`) remain
+      distinguishable.
     * `:lease_duration` - lease TTL in milliseconds (default `30_000`)
     * `:heartbeat_interval` - runner lease renewal interval in ms (default `10_000`)
-    * `:recovery_interval` - reclaim scan interval in ms (default `5_000`)
+    * `:recovery_interval` - reclaim scan interval in ms (default `5_000`);
+      a small random jitter is added to each scan to avoid thundering herds
+    * `:recovery_schedule` - whether `Interruptus.Recovery` scans periodically
+      (default `true`; tests typically disable it and call
+      `Interruptus.Recovery.recover_all/1` manually)
+    * `:retention_ms` - age threshold for optional terminal purge during
+      recovery scans (`nil` disables; default `nil`)
+    * `:purge_schedule` - when `true` and `:retention_ms` is set, Recovery
+      calls `Interruptus.purge_terminal/1` after each reclaim scan (default `false`)
+
+  ## Process names
+
+  Each Interruptus instance runs its own supervision tree under the host
+  application. Process names are derived from `:name` via `Module.concat/2`,
+  e.g. the default instance uses `Interruptus.Registry`,
+  `Interruptus.RunnerSupervisor`, `Interruptus.TaskSupervisor`, and
+  `Interruptus.Recovery`.
   """
 
   @type t :: %__MODULE__{
@@ -26,7 +45,10 @@ defmodule Interruptus.Config do
           node_id: String.t(),
           lease_duration: pos_integer(),
           heartbeat_interval: pos_integer(),
-          recovery_interval: pos_integer()
+          recovery_interval: pos_integer(),
+          recovery_schedule: boolean(),
+          retention_ms: pos_integer() | nil,
+          purge_schedule: boolean()
         }
 
   defstruct name: Interruptus,
@@ -35,13 +57,17 @@ defmodule Interruptus.Config do
             node_id: nil,
             lease_duration: 30_000,
             heartbeat_interval: 10_000,
-            recovery_interval: 5_000
+            recovery_interval: 5_000,
+            recovery_schedule: true,
+            retention_ms: nil,
+            purge_schedule: false
 
   @doc """
   Builds configuration from application env and optional overrides.
 
   Merges `opts` over `Application.get_env(:interruptus, name, [])`. When
-  `:node_id` is omitted, it defaults to the current node name as a string.
+  `:node_id` is omitted, it defaults to the current node name plus a random
+  per-boot token.
 
   ## Arguments
 
@@ -110,11 +136,70 @@ defmodule Interruptus.Config do
     config
   end
 
+  @doc """
+  Returns the registered name of the per-instance supervisor.
+  """
+  @spec supervisor_name(t() | atom()) :: atom()
+  def supervisor_name(config), do: process_name(config, "Supervisor")
+
+  @doc """
+  Returns the registered name of the per-instance runner Registry.
+  """
+  @spec registry_name(t() | atom()) :: atom()
+  def registry_name(config), do: process_name(config, "Registry")
+
+  @doc """
+  Returns the registered name of the per-instance runner DynamicSupervisor.
+  """
+  @spec runner_supervisor_name(t() | atom()) :: atom()
+  def runner_supervisor_name(config), do: process_name(config, "RunnerSupervisor")
+
+  @doc """
+  Returns the registered name of the per-instance stage Task.Supervisor.
+  """
+  @spec task_supervisor_name(t() | atom()) :: atom()
+  def task_supervisor_name(config), do: process_name(config, "TaskSupervisor")
+
+  @doc """
+  Returns the registered name of the per-instance Recovery process.
+  """
+  @spec recovery_name(t() | atom()) :: atom()
+  def recovery_name(config), do: process_name(config, "Recovery")
+
+  @spec process_name(t() | atom(), String.t()) :: atom()
+  defp process_name(%__MODULE__{name: name}, suffix), do: process_name(name, suffix)
+
+  defp process_name(name, suffix) when is_atom(name) do
+    Module.concat(name, suffix)
+  end
+
   @spec validate!(t()) :: t()
+  defp validate!(%__MODULE__{repo: nil}) do
+    raise ArgumentError, "Interruptus.Config requires :repo (got nil)"
+  end
+
   defp validate!(%__MODULE__{node_id: nil} = config) do
-    node = Atom.to_string(Node.self())
-    %{config | node_id: node}
+    %{config | node_id: "#{Node.self()}/#{boot_token()}"}
   end
 
   defp validate!(config), do: config
+
+  # A random token generated once per VM start. Ensures every BEAM instance
+  # has a distinct lease identity even when nodes are not distributed (all
+  # named nonode@nohost) or share a node name across restarts.
+  @spec boot_token() :: String.t()
+  defp boot_token do
+    case :persistent_term.get({__MODULE__, :boot_token}, nil) do
+      nil ->
+        token =
+          :crypto.strong_rand_bytes(5)
+          |> Base.encode32(case: :lower, padding: false)
+
+        :persistent_term.put({__MODULE__, :boot_token}, token)
+        token
+
+      token ->
+        token
+    end
+  end
 end

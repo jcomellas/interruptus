@@ -38,14 +38,14 @@ defmodule Interruptus.EngineTest do
     command = Simple.new(%{value: 2})
     [_, checkpoint] = Simple.flattened_pipelines()
 
-    assert {:error, :verify_failed} = Engine.run_segment(Simple, checkpoint, command)
+    assert {:error, :verify_failed, ^command} = Engine.run_segment(Simple, checkpoint, command)
   end
 
   test "invalid verify result returns error" do
     command = InvalidVerify.new()
     [checkpoint] = InvalidVerify.flattened_pipelines()
 
-    assert {:error, {:invalid_verify_result, :bogus}} =
+    assert {:error, {:invalid_verify_result, :bogus}, ^command} =
              Engine.run_segment(InvalidVerify, checkpoint, command)
   end
 
@@ -83,6 +83,61 @@ defmodule Interruptus.EngineTest do
     command = Slow.new()
     [stage] = Slow.flattened_pipelines()
 
-    assert {:error, :timeout} = Engine.run_segment(Slow, stage, command, timeout: 50)
+    assert {:error, :timeout, ^command} = Engine.run_segment(Slow, stage, command, timeout: 50)
+  end
+
+  test "raised exceptions are contained as error tuples" do
+    alias Interruptus.Test.Support.Workflows.Raising
+
+    command = Raising.new(%{id: "e1"})
+    [_first, boom_segment | _] = Raising.flattened_pipelines()
+
+    assert {:error, {:exception, %RuntimeError{message: message}, stacktrace}, ^command} =
+             Engine.run_segment(Raising, boom_segment, command)
+
+    assert message =~ "boom stage always raises"
+    assert is_list(stacktrace)
+
+    # Same containment on the timeout execution path.
+    assert {:error, {:exception, %RuntimeError{}, _}, ^command} =
+             Engine.run_segment(Raising, boom_segment, command, timeout: 5_000)
+  end
+
+  test "invalid stage return values are errors, not crashes" do
+    alias Interruptus.Test.Support.Workflows.BadReturn
+
+    command = BadReturn.new()
+    [segment] = BadReturn.flattened_pipelines()
+
+    assert {:error, {:invalid_stage_result, :oops}, ^command} =
+             Engine.run_segment(BadReturn, segment, command)
+
+    assert {:error, {:invalid_stage_result, :oops}, ^command} =
+             Engine.run_segment(BadReturn, segment, command, timeout: 5_000)
+  end
+
+  test "run_span/5 runs bare stages through the next checkpoint" do
+    alias Interruptus.Test.Support.Workflows.SpanStages
+
+    command = SpanStages.new(%{value: 10})
+    segments = SpanStages.flattened_pipelines()
+
+    assert {:ok, updated, 2} = Engine.run_span(SpanStages, segments, 0, command)
+    assert updated.data.a == 10
+    assert updated.data.b == 11
+    assert updated.data.c == 12
+
+    # Starting at the checkpoint alone still returns that index.
+    assert {:ok, _cmd, 2} = Engine.run_span(SpanStages, segments, 2, updated)
+  end
+
+  test "run_span/5 stops at suspend inside a span" do
+    command = Suspendable.new(%{token: "t1"})
+    segments = Suspendable.flattened_pipelines()
+
+    assert {:suspend, :await_approval, %{token: "t1"}, updated, 1} =
+             Engine.run_span(Suspendable, segments, 0, command)
+
+    assert updated.data.step == 1
   end
 end
