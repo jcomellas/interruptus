@@ -5,7 +5,6 @@ defmodule Interruptus.CompensationTest do
 
   alias Interruptus
   alias Interruptus.Policy.Rollback
-  alias Interruptus.RunnerSupervisor
   alias Interruptus.Store
   alias Interruptus.Test
   alias Interruptus.Test.Support.Barrier, as: BarrierGate
@@ -22,20 +21,21 @@ defmodule Interruptus.CompensationTest do
   end
 
   describe "compensation_plan/2" do
-    test "scopes per-checkpoint compensations to passed checkpoints, LIFO" do
+    test "includes passed and in-flight checkpoint compensations, LIFO" do
       # Segment layout: 0 = ckpt(undo_one), 1 = ckpt(undo_two),
       # 2 = ckpt(no compensate), 3 = ckpt(undo_never)
-      assert Rollback.compensation_plan(CompCrash, 0) == []
-      assert Rollback.compensation_plan(CompCrash, 1) == [:undo_one]
+      # Index is inclusive: the checkpoint at current_stage_index is tentative.
+      assert Rollback.compensation_plan(CompCrash, 0) == [:undo_one]
+      assert Rollback.compensation_plan(CompCrash, 1) == [:undo_two, :undo_one]
       assert Rollback.compensation_plan(CompCrash, 2) == [:undo_two, :undo_one]
-      assert Rollback.compensation_plan(CompCrash, 3) == [:undo_two, :undo_one]
+      assert Rollback.compensation_plan(CompCrash, 3) == [:undo_never, :undo_two, :undo_one]
       assert Rollback.compensation_plan(CompCrash, 4) == [:undo_never, :undo_two, :undo_one]
     end
 
     test "appends the workflow-level rollback list after checkpoint compensations" do
       # Raising: segment 0 = ckpt(undo_first), 1 = ckpt(boom, no compensate);
       # workflow-level list: [:final_cleanup].
-      assert Rollback.compensation_plan(Raising, 0) == [:final_cleanup]
+      assert Rollback.compensation_plan(Raising, 0) == [:undo_first, :final_cleanup]
       assert Rollback.compensation_plan(Raising, 1) == [:undo_first, :final_cleanup]
     end
   end
@@ -147,29 +147,15 @@ defmodule Interruptus.CompensationTest do
   end
 
   test "failure with no compensations marks the workflow :failed", %{config: config} do
-    past = DateTime.add(DateTime.utc_now(), -60, :second)
+    alias Interruptus.Test.Support.Workflows.NoCompensate
 
-    # CompCrash at index 0: nothing passed, empty plan -> :failed, not
-    # :compensated (nothing was rolled back).
-    {:ok, instance} =
-      Store.insert_workflow(config, %{
-        workflow_type: "Interruptus.Test.Support.Workflows.CompCrash",
-        status: :running,
-        params: %{"token" => "no-comp"},
-        data: %{},
-        current_stage_index: 0,
-        pipeline_version: 1,
-        attempt_count: 3,
-        locked_by: "dead-node",
-        locked_until: past
-      })
-
-    assert {:ok, _pid} = RunnerSupervisor.start_runner(config, CompCrash, instance.id)
+    assert {:ok, instance} =
+             Interruptus.start(NoCompensate, %{id: "no-comp"}, config: config.name)
 
     assert {:ok, failed} =
              Test.await_status(instance.id, :failed, config: config, timeout: 10_000)
 
-    assert failed.errors["failure"] =~ "attempts_exhausted"
+    assert failed.errors["failure"] =~ "halted"
     assert CompensateOrder.all() == []
   end
 

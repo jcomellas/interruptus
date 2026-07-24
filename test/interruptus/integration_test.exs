@@ -87,7 +87,8 @@ defmodule Interruptus.IntegrationTest do
         pipeline_version: 1
       })
 
-    assert {:ok, %{status: :cancelled}} = Interruptus.cancel(instance.id, config: config.name)
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.cancel(instance.id, config: config.name, compensate: false, force: true)
     assert {:error, :terminal} = Interruptus.resume(instance.id, config: config.name)
   end
 
@@ -140,5 +141,28 @@ defmodule Interruptus.IntegrationTest do
     :ok = Interruptus.Recovery.recover_all(config)
     refute Test.runner_pid(instance.id)
     assert {:ok, %{status: :suspended}} = Interruptus.status(instance.id, config: config.name)
+  end
+
+  test "pipeline_fingerprint mismatch parks the workflow as suspended", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Simple",
+        status: :pending,
+        params: %{"value" => 1},
+        data: %{},
+        current_stage_index: 0,
+        pipeline_version: 1,
+        pipeline_fingerprint: "deadbeef"
+      })
+
+    assert {:ok, _pid} =
+             Interruptus.RunnerSupervisor.start_runner(config, Simple, instance.id)
+
+    assert {:ok, parked} =
+             Test.await_status(instance.id, :suspended, config: config, timeout: 5_000)
+
+    assert parked.suspend_reason == "pipeline_fingerprint_mismatch"
+    assert parked.suspend_metadata["stored"] == "deadbeef"
+    assert parked.suspend_metadata["compiled"] == Simple.pipeline_fingerprint()
   end
 end

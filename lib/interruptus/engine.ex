@@ -201,6 +201,9 @@ defmodule Interruptus.Engine do
       {:suspend, reason, metadata} ->
         {:suspend, reason, metadata, command}
 
+      {:error, reason, %{} = failed_command} ->
+        {:error, reason, failed_command}
+
       {:error, reason} ->
         {:error, reason, command}
 

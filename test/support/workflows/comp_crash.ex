@@ -13,10 +13,12 @@ defmodule Interruptus.Test.Support.Workflows.CompCrash do
     data :phase, :integer
 
     checkpoint compensate: :undo_one do
+      verify :verify_a
       pipeline :step_a
     end
 
     checkpoint compensate: :undo_two do
+      verify :verify_b
       pipeline :step_b
     end
 
@@ -25,6 +27,7 @@ defmodule Interruptus.Test.Support.Workflows.CompCrash do
     end
 
     checkpoint compensate: :undo_never do
+      verify :verify_never
       pipeline :unreached
     end
 
@@ -37,6 +40,16 @@ defmodule Interruptus.Test.Support.Workflows.CompCrash do
   def always_halts(command, _params, _data), do: Command.halt(command)
 
   def unreached(command, _params, _data), do: command
+
+  def verify_a(command) do
+    if command.data.phase >= 1, do: :done, else: :not_done
+  end
+
+  def verify_b(command) do
+    if command.data.phase >= 2, do: :done, else: :not_done
+  end
+
+  def verify_never(_command), do: :not_done
 
   # LIFO: undo_two runs first. It gates on a barrier so tests can crash the
   # runner mid-compensation.

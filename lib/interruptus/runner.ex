@@ -251,10 +251,22 @@ defmodule Interruptus.Runner do
         schedule_heartbeat(config)
         state = %{state | instance: instance}
 
-        if instance.pipeline_version == workflow_module.pipeline_version() do
-          start_from_claim(state)
-        else
-          park_version_mismatch(state)
+        cond do
+          instance.pipeline_version != workflow_module.pipeline_version() ->
+            park_identity_mismatch(state, "pipeline_version_mismatch", %{
+              "stored" => instance.pipeline_version,
+              "compiled" => workflow_module.pipeline_version()
+            })
+
+          instance.pipeline_fingerprint != "" and
+              instance.pipeline_fingerprint != workflow_module.pipeline_fingerprint() ->
+            park_identity_mismatch(state, "pipeline_fingerprint_mismatch", %{
+              "stored" => instance.pipeline_fingerprint,
+              "compiled" => workflow_module.pipeline_fingerprint()
+            })
+
+          true ->
+            start_from_claim(state)
         end
 
       {:error, _reason} ->
@@ -286,29 +298,26 @@ defmodule Interruptus.Runner do
 
   # Deploy-skew guard: never execute positional stage indexes recorded by a
   # different pipeline layout. Parks as :suspended for operator action.
-  @spec park_version_mismatch(state()) :: step()
-  defp park_version_mismatch(state) do
-    %{config: config, instance: instance, workflow_module: workflow_module} = state
-
-    stored = instance.pipeline_version
-    compiled = workflow_module.pipeline_version()
+  @spec park_identity_mismatch(state(), String.t(), map()) :: step()
+  defp park_identity_mismatch(state, reason, metadata) do
+    %{config: config, instance: instance} = state
 
     Logger.warning(
-      "interruptus pipeline version mismatch workflow_id=#{instance.id} " <>
-        "stored=#{stored} compiled=#{compiled}; parking as :suspended"
+      "interruptus pipeline identity mismatch workflow_id=#{instance.id} " <>
+        "reason=#{reason} metadata=#{inspect(metadata)}; parking as :suspended"
     )
 
     :telemetry.execute(
       [:interruptus, :workflow, :version_mismatch],
       %{},
-      %{workflow_id: instance.id, stored: stored, compiled: compiled}
+      %{workflow_id: instance.id, reason: reason, metadata: metadata}
     )
 
     write =
       Store.update_as_holder(config, instance, config.node_id, %{
         status: :suspended,
-        suspend_reason: "pipeline_version_mismatch",
-        suspend_metadata: %{"stored" => stored, "compiled" => compiled},
+        suspend_reason: reason,
+        suspend_metadata: metadata,
         locked_by: nil,
         locked_until: nil
       })

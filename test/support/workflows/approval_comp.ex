@@ -12,6 +12,7 @@ defmodule Interruptus.Test.Support.Workflows.ApprovalComp do
     data :step, :integer
 
     checkpoint compensate: :undo_reserve do
+      verify :verify_reserve
       pipeline :reserve
     end
 
@@ -30,6 +31,10 @@ defmodule Interruptus.Test.Support.Workflows.ApprovalComp do
     else
       {:suspend, :await_approval, %{token: command.params.token}}
     end
+  end
+
+  def verify_reserve(command) do
+    if command.data.step >= 1, do: :done, else: :not_done
   end
 
   def undo_reserve(command) do

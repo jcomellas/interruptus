@@ -13,6 +13,7 @@ defmodule Interruptus.Test.Support.Workflows.Raising do
     data :step, :integer
 
     checkpoint compensate: :undo_first do
+      verify :verify_first
       pipeline :first_step
     end
 
@@ -31,6 +32,10 @@ defmodule Interruptus.Test.Support.Workflows.Raising do
   def boom(_command, _params, _data) do
     InvocationCounter.increment(:boom)
     raise "boom stage always raises"
+  end
+
+  def verify_first(command) do
+    if command.data.step == 1, do: :done, else: :not_done
   end
 
   def undo_first(command) do

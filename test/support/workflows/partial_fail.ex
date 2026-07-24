@@ -2,7 +2,8 @@ defmodule Interruptus.Test.Support.Workflows.PartialFail do
   @moduledoc false
 
   # First checkpoint completes (so compensation is in scope). Second checkpoint
-  # mutates data then raises; compensation must see the mutated command.
+  # mutates data then raises; compensation must see the mutated command and
+  # run the in-flight undo_mutate before undo_setup.
 
   use Interruptus.Workflow
 
@@ -16,10 +17,12 @@ defmodule Interruptus.Test.Support.Workflows.PartialFail do
     data :comp_seen, :string
 
     checkpoint compensate: :undo_setup do
+      verify :verify_setup
       pipeline :setup
     end
 
     checkpoint compensate: :undo_mutate do
+      verify :verify_mutate
       pipeline :mutate
       pipeline :boom
     end
@@ -37,6 +40,14 @@ defmodule Interruptus.Test.Support.Workflows.PartialFail do
 
   def boom(_command, _params, _data) do
     raise "partial fail boom"
+  end
+
+  def verify_setup(command) do
+    if command.data.seen in ["setup", "from-mutate"], do: :done, else: :not_done
+  end
+
+  def verify_mutate(command) do
+    if command.data.seen == "from-mutate", do: :done, else: :not_done
   end
 
   def undo_setup(command) do

@@ -14,6 +14,7 @@ defmodule Interruptus.HardeningTest do
   alias Interruptus.Test.Support.Barrier
   alias Interruptus.Test.Support.CompensateOrder
   alias Interruptus.Test.Support.Workflows.BarrierCompensate
+  alias Interruptus.Test.Support.Workflows.CompCrash
   alias Interruptus.Test.Support.Workflows.DefaultsData
   alias Interruptus.Test.Support.Workflows.HaltSuccess
   alias Interruptus.Test.Support.Workflows.NoCompensate
@@ -35,7 +36,7 @@ defmodule Interruptus.HardeningTest do
     :ok = Test.await_barrier_held(:before_cancel_comp)
 
     assert {:ok, %{status: :compensating}} =
-             Interruptus.cancel(instance.id, config: config.name, compensate: true)
+             Interruptus.cancel(instance.id, config: config.name)
 
     :ok = Barrier.release(:before_cancel_comp)
 
@@ -66,10 +67,11 @@ defmodule Interruptus.HardeningTest do
     assert {:ok, compensated} =
              Test.await_status(instance.id, :compensated, config: config, timeout: 10_000)
 
-    # Only the passed checkpoint is compensated; the in-memory/persisted
-    # snapshot still carries seen=from-mutate into undo_setup.
-    assert CompensateOrder.all() == [{:undo_setup, "from-mutate"}]
+    # In-flight checkpoint compensate (undo_mutate) runs first (LIFO).
+    # CompensateOrder.all/0 is newest-first.
+    assert CompensateOrder.all() == [{:undo_setup, "from-mutate"}, {:undo_mutate, "from-mutate"}]
     assert compensated.data["seen"] == "from-mutate"
+    assert compensated.data["comp_seen"] == "from-mutate"
   end
 
   test "same-stage suspend after mutation persists data via Command.suspend/3", %{config: config} do
@@ -224,10 +226,33 @@ defmodule Interruptus.HardeningTest do
     end
   end
 
+  test "cancel during compensating requires force", %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(CompCrash, %{token: "comp-force"}, config: config.name)
+
+    :ok = Test.await_barrier_held(:in_undo_two, timeout: 10_000)
+
+    assert {:ok, %{status: :compensating}} = Interruptus.status(instance.id, config: config.name)
+
+    assert {:error, :compensation_in_progress} =
+             Interruptus.cancel(instance.id, config: config.name)
+
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.cancel(instance.id,
+               config: config.name,
+               compensate: false,
+               force: true
+             )
+
+    :ok = Barrier.release(:in_undo_two)
+  end
+
   test "Effect.once returns effect_marker_failed when put cannot succeed", %{config: config} do
     command = %{Simple.new(value: 1) | workflow_id: nil}
 
-    assert {:error, {:effect_marker_failed, :missing_workflow_id}} =
-             Effect.once(command, "k", fn cmd -> Interruptus.Command.put_data(cmd, :result, 1) end, config: config.name)
+    assert {:error, {:effect_marker_failed, :missing_workflow_id}, _} =
+             Effect.once(command, "k", fn cmd -> Interruptus.Command.put_data(cmd, :result, 1) end,
+               config: config.name
+             )
   end
 end

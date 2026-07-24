@@ -1,14 +1,21 @@
 defmodule Interruptus.Policy.Rollback do
   @moduledoc """
-  Rollback policy: LIFO compensation over passed checkpoints.
+  Rollback policy: LIFO compensation over passed **and in-flight** checkpoints.
 
-  When restart attempts are exhausted, compensation runs in two parts:
+  When restart attempts are exhausted (or cancel requests compensation),
+  compensation runs in two parts:
 
   1. Per-checkpoint compensations (`checkpoint compensate: :fun do ... end`)
-     for checkpoints the workflow actually **passed** (their snapshot was
-     persisted), in LIFO order.
+     for checkpoints the workflow **passed** (snapshot persisted) **and** the
+     checkpoint at `current_stage_index` when it has `compensate:` (tentative
+     undo for in-flight segment side effects), in LIFO order.
   2. The workflow-level `rollback_policy compensate: [...]` list, also in LIFO
      order, appended after the per-checkpoint compensations.
+
+  Compensations **must be idempotent**: the in-flight step may never have
+  applied externally, or may have applied before a crash. Prefer checking
+  durable/external state (or `Interruptus.Effect.exists?/3`) inside compensate
+  functions and no-op when there is nothing to undo.
 
   `Interruptus.Runner` executes the plan one function at a time, persisting
   `compensation_index` after each success, so a crash mid-compensation resumes
@@ -16,8 +23,7 @@ defmodule Interruptus.Policy.Rollback do
   plan.
 
   Each function receives the current command struct and must return an updated
-  struct, `{:ok, struct}`, or `{:error, reason}`. Compensation functions must
-  be idempotent: the step that was in flight during a crash runs again.
+  struct, `{:ok, struct}`, or `{:error, reason}`.
   """
 
   alias Interruptus.Command
@@ -29,11 +35,15 @@ defmodule Interruptus.Policy.Rollback do
   @doc """
   Builds the ordered compensation plan for a workflow at a given progress point.
 
+  Includes checkpoint compensations for segments `0..current_stage_index`
+  (inclusive): passed checkpoints plus the in-flight segment when it declares
+  `compensate:`.
+
   ## Arguments
 
     * `workflow_module` - module using `Interruptus.Workflow`
-    * `current_stage_index` - persisted `current_stage_index` of the instance;
-      only checkpoints **before** this index are compensated
+    * `current_stage_index` - persisted `current_stage_index` of the instance
+      (next segment to execute; that index is included when compensable)
 
   ## Returns
 
@@ -51,10 +61,8 @@ defmodule Interruptus.Policy.Rollback do
   def compensation_plan(workflow_module, current_stage_index) do
     checkpoint_compensations =
       workflow_module.flattened_pipelines()
-      |> Enum.take(current_stage_index)
-      |> Enum.filter(fn segment ->
-        segment.type == :checkpoint and Map.get(segment, :compensate) != nil
-      end)
+      |> Enum.take(current_stage_index + 1)
+      |> Enum.filter(&checkpoint_with_compensate?/1)
       |> Enum.map(&Map.get(&1, :compensate))
       |> Enum.reverse()
 
@@ -62,6 +70,11 @@ defmodule Interruptus.Policy.Rollback do
       workflow_module.rollback_policy().compensate |> Enum.reverse()
 
     checkpoint_compensations ++ workflow_compensations
+  end
+
+  @spec checkpoint_with_compensate?(map()) :: boolean()
+  defp checkpoint_with_compensate?(segment) do
+    segment.type == :checkpoint and Map.get(segment, :compensate) != nil
   end
 
   @doc """

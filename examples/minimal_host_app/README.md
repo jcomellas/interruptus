@@ -69,11 +69,12 @@ checkpoint compensate: :reverse_debit do
 end
 ```
 
-On failure after retries are exhausted, only checkpoints the workflow passed
-are compensated, LIFO, with progress persisted per step — a crash mid-rollback
-resumes where it stopped. Saga-style cancellation is available via
-`Interruptus.cancel(workflow.id, compensate: true)` (evicts any live runner
-and starts compensation).
+On failure after retries are exhausted, **passed and in-flight** checkpoints
+are compensated, LIFO (compensations must be idempotent), with progress
+persisted per step — a crash mid-rollback resumes where it stopped. Cancel
+defaults to compensation: `Interruptus.cancel(workflow.id)` (evicts any live
+runner and starts compensation when the plan is non-empty). Use
+`compensate: false, force: true` only when deliberately abandoning rollback.
 
 ## Idempotent start
 

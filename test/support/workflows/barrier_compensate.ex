@@ -13,6 +13,7 @@ defmodule Interruptus.Test.Support.Workflows.BarrierCompensate do
     data :step, :integer
 
     checkpoint compensate: :undo_reserve do
+      verify :verify_reserve
       pipeline :reserve
     end
 
@@ -29,6 +30,10 @@ defmodule Interruptus.Test.Support.Workflows.BarrierCompensate do
     Barrier.hold(:before_cancel_comp)
     :ok = Barrier.await(:before_cancel_comp)
     Command.put_data(command, :step, 2)
+  end
+
+  def verify_reserve(command) do
+    if command.data.step >= 1, do: :done, else: :not_done
   end
 
   def undo_reserve(command) do

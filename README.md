@@ -74,8 +74,9 @@ defmodule MyApp.TransferFunds do
 
     pipeline :validate
 
-    # Per-checkpoint compensations (preferred): run in LIFO order during
-    # rollback, but only for checkpoints the workflow actually passed.
+    # Per-checkpoint compensations (preferred): LIFO over passed **and
+    # in-flight** checkpoints. `verify` is required when `compensate:` is set.
+    # Compensations must be idempotent.
     checkpoint compensate: :reverse_debit do
       verify :verify_debit
       pipeline :debit_account
@@ -112,22 +113,23 @@ end
   stays `:failed`.
 - **Compensation is durable** — `compensation_index` is persisted after each
   compensation function; a crash mid-rollback is reclaimed and resumes from the
-  last completed step. Compensations run for passed checkpoints (plus any
-  workflow-level `rollback_policy` list). Entering compensation persists the
-  current command snapshot so reclaim sees the same data.
-- **Cancel fences live runners** — `Interruptus.cancel/2` bumps the fencing
-  token; a running runner fails its next write and stops. `cancel(id, compensate: true)`
-  fences the row, **evicts** any registered runner, and starts a fresh
-  compensation runner (Recovery finishes the job if start fails).
+  last completed step. Compensations run for **passed and in-flight** checkpoints
+  (plus any workflow-level `rollback_policy` list) and must be idempotent.
+  Entering compensation persists the current command snapshot so reclaim sees
+  the same data.
+- **Cancel defaults to compensate** — `Interruptus.cancel/2` bumps the fencing
+  token, **always evicts** any registered runner, and defaults to
+  `compensate: true`. Plain cancel with a non-empty plan requires
+  `force: true`. Cancel while `:compensating` requires `force: true`.
 - **Long stages and verify are safe** — lease heartbeats renew concurrently with
   segment tasks; `stage_timeout` applies to both stages and `verify/1`.
 - **Start is durable first** — if the workflow row commits but the runner cannot
   start immediately, `start/3` still returns `{:ok, instance}`; Recovery reclaims
   lease-less `:pending` rows.
-- **Deploy skew is detected** — a persisted `pipeline_version` that differs from
-  the compiled workflow parks the instance as `:suspended`
-  (`"pipeline_version_mismatch"`). Unresolvable `workflow_type` rows are parked
-  as `:suspended` (`"unknown_workflow_type"`) so they cannot starve reclaim.
+- **Deploy skew is detected** — mismatched `pipeline_version` or automatic
+  `pipeline_fingerprint` parks the instance as `:suspended`. Unresolvable
+  `workflow_type` rows are parked as `:suspended` (`"unknown_workflow_type"`)
+  so they cannot starve reclaim.
 - **Suspend with mutations** — prefer `Command.suspend(command, reason, metadata)`
   (4-tuple) when the stage has already updated `data`/`params`; the 3-tuple
   `{:suspend, reason, metadata}` keeps the pre-stage command.
@@ -138,7 +140,12 @@ Interruptus persists workflow state in the host application's PostgreSQL databas
 
 - Stage DB writes and checkpoint writes are **independent commits** — not one atomic unit.
 - Segments between checkpoints may run **at-least-once** after a crash; use idempotent side effects, domain unique constraints, and checkpoint `verify/1`.
-- `Interruptus.Effect` records `(workflow_id, effect_key)` markers so successful work can be skipped on replay. Markers are not written for halted or suspended results. A marker insert failure after a successful effect returns `{:error, {:effect_marker_failed, reason}}` so the restart policy applies (do not treat as success). Markers do not defend against two runners racing in a lease-expiry window — use domain unique constraints for hard once-only guarantees.
+- `Interruptus.Effect.once/4` **claims** a `(workflow_id, effect_key)` marker as
+  `:pending` before running work, then marks `:applied` on success (or deletes
+  pending on halt/suspend/error). `exists?/3` is true only for `:applied`.
+  Stale pending markers (older than the lease duration) may be reclaimed.
+  Concurrent callers serialize on the unique key; domain unique constraints are
+  still required for hard once-only guarantees against external systems.
 - `lock_version` is a fencing token bumped on every state-changing write. It fences **workflow-row** updates only — not host-table writes from a stale runner after lease expiry. In-flight external side effects may still complete after a fence until the process exits.
 
 ### Do not nest API calls in transactions

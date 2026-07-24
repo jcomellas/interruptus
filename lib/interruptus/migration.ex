@@ -22,7 +22,7 @@ defmodule Interruptus.Migration do
 
   use Ecto.Migration
 
-  @current_version 4
+  @current_version 5
 
   @doc """
   Runs all Interruptus migrations up to the current version.
@@ -83,6 +83,7 @@ defmodule Interruptus.Migration do
     prefix = Keyword.get(opts, :prefix)
 
     cond do
+      column_exists?("interruptus_workflows", "pipeline_fingerprint", prefix) -> 5
       constraint_exists?("interruptus_workflows_status_check", prefix) -> 4
       column_exists?("interruptus_workflows", "compensation_index", prefix) -> 3
       table_exists?("interruptus_effects", prefix) -> 2
@@ -361,6 +362,54 @@ defmodule Interruptus.Migration do
     )
 
     drop_if_exists table(:interruptus_effects, prefix: prefix)
+
+    :ok
+  end
+
+  # Version 5 migration: effect pending/applied status + pipeline fingerprint.
+  @doc false
+  @spec up5(keyword()) :: :ok
+  def up5(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      add_if_not_exists :pipeline_fingerprint, :string, null: false, default: ""
+    end
+
+    alter table(:interruptus_effects, prefix: prefix) do
+      add_if_not_exists :status, :string, null: false, default: "applied"
+      add_if_not_exists :updated_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    end
+
+    execute("""
+    ALTER TABLE #{prefix_sql}interruptus_effects
+    ADD CONSTRAINT interruptus_effects_status_check
+    CHECK (status IN ('pending', 'applied'))
+    """)
+
+    :ok
+  end
+
+  # Version 5 rollback: drops fingerprint and effect status columns.
+  @doc false
+  @spec down5(keyword()) :: :ok
+  def down5(opts \\ []) do
+    prefix = Keyword.get(opts, :prefix)
+    prefix_sql = if prefix, do: "#{prefix}.", else: ""
+
+    execute(
+      "ALTER TABLE #{prefix_sql}interruptus_effects DROP CONSTRAINT IF EXISTS interruptus_effects_status_check"
+    )
+
+    alter table(:interruptus_effects, prefix: prefix) do
+      remove_if_exists :updated_at, :utc_datetime_usec
+      remove_if_exists :status, :string
+    end
+
+    alter table(:interruptus_workflows, prefix: prefix) do
+      remove_if_exists :pipeline_fingerprint, :string
+    end
 
     :ok
   end

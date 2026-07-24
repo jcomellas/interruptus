@@ -185,7 +185,8 @@ defmodule Interruptus.RunnerInterruptionTest do
     :ok = Test.await_barrier_held(:before_checkpoint)
     :ok = Test.expire_lease(config, instance.id)
 
-    assert {:ok, %{status: :cancelled}} = Interruptus.cancel(instance.id, config: config.name)
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.cancel(instance.id, config: config.name, compensate: false, force: true)
     assert {:error, :terminal} = Interruptus.resume(instance.id, config: config.name)
 
     # The fenced runner may already have stopped via its heartbeat; crash it

@@ -31,6 +31,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
   ## Progress fields
 
     * `current_stage_index` — next flattened segment to execute
+    * `pipeline_fingerprint` — structural hash of the compiled pipeline layout
     * `attempt_count` — persisted **before** each execution attempt of the
       current segment span; reset to `0` on every successful checkpoint
     * `compensation_index` — number of compensation functions already applied
@@ -61,6 +62,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
           data: map(),
           current_stage_index: integer(),
           pipeline_version: integer(),
+          pipeline_fingerprint: String.t(),
           idempotency_key: String.t() | nil,
           locked_by: String.t() | nil,
           locked_until: DateTime.t() | nil,
@@ -93,6 +95,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
     field :data, :map, default: %{}
     field :current_stage_index, :integer, default: 0
     field :pipeline_version, :integer, default: 1
+    field :pipeline_fingerprint, :string, default: ""
     field :idempotency_key, :string
     field :locked_by, :string
     field :locked_until, :utc_datetime_usec
@@ -122,6 +125,7 @@ defmodule Interruptus.Schemas.WorkflowInstance do
       :data,
       :current_stage_index,
       :pipeline_version,
+      :pipeline_fingerprint,
       :idempotency_key,
       :locked_by,
       :locked_until,

@@ -256,6 +256,7 @@ defmodule Interruptus.Command do
           | {:suspend, term(), map()}
           | {:suspend, term(), map(), t()}
           | {:error, term()}
+          | {:error, term(), t()}
   def apply_fun(%mod{params: params, data: data} = command, name) when is_atom(name) do
     apply(mod, name, [command, params, data])
   end

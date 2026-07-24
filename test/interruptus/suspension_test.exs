@@ -88,14 +88,15 @@ defmodule Interruptus.SuspensionTest do
     assert row.locked_by == config.node_id
     assert DateTime.compare(row.locked_until, DateTime.utc_now()) == :gt
 
-    assert {:ok, %{status: :cancelled}} = Interruptus.cancel(instance.id, config: config.name)
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.cancel(instance.id, config: config.name, compensate: false, force: true)
 
     # Let the in-flight stage finish; the runner's next fenced write must fail
     # and the runner must stop without resurrecting the workflow.
     :ok = BarrierGate.release(:before_checkpoint)
 
     assert_receive {:DOWN, ^ref, :process, ^runner, reason}, 5_000
-    assert reason in [:normal, :lease_lost]
+    assert reason in [:normal, :lease_lost, :shutdown]
 
     row = Store.get(config, instance.id)
     assert row.status == :cancelled
@@ -108,7 +109,7 @@ defmodule Interruptus.SuspensionTest do
     assert {:error, :terminal} = Interruptus.cancel(instance.id, config: config.name)
   end
 
-  test "cancel with compensate: true rolls back passed checkpoints", %{config: config} do
+  test "cancel with compensate rolls back passed checkpoints", %{config: config} do
     assert {:ok, instance} =
              Interruptus.start(ApprovalComp, %{token: "comp-cancel"}, config: config.name)
 
@@ -117,7 +118,7 @@ defmodule Interruptus.SuspensionTest do
     assert suspended.current_stage_index == 1
 
     assert {:ok, %{status: :compensating}} =
-             Interruptus.cancel(instance.id, config: config.name, compensate: true)
+             Interruptus.cancel(instance.id, config: config.name)
 
     assert {:ok, compensated} =
              Test.await_status(instance.id, :compensated, config: config, timeout: 10_000)
@@ -129,7 +130,7 @@ defmodule Interruptus.SuspensionTest do
     assert {:error, :terminal} = Interruptus.resume(instance.id, config: config.name)
   end
 
-  test "cancel with compensate: true and no passed checkpoints cancels plainly",
+  test "cancel at index 0 still runs in-flight checkpoint compensate",
        %{config: config} do
     {:ok, instance} =
       Store.insert_workflow(config, %{
@@ -138,13 +139,29 @@ defmodule Interruptus.SuspensionTest do
         params: %{"token" => "nothing-done"},
         data: %{},
         current_stage_index: 0,
-        pipeline_version: 1
+        pipeline_version: 1,
+        pipeline_fingerprint: ApprovalComp.pipeline_fingerprint()
       })
 
-    assert {:ok, %{status: :cancelled}} =
-             Interruptus.cancel(instance.id, config: config.name, compensate: true)
+    assert {:ok, %{status: :compensating}} =
+             Interruptus.cancel(instance.id, config: config.name)
 
-    assert CompensateOrder.all() == []
+    assert {:ok, compensated} =
+             Test.await_status(instance.id, :compensated, config: config, timeout: 10_000)
+
+    assert CompensateOrder.all() == [:undo_reserve]
+    assert compensated.compensation_index == 1
+  end
+
+  test "plain cancel without force is rejected when a compensation plan exists",
+       %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(ApprovalComp, %{token: "need-force"}, config: config.name)
+
+    assert {:ok, _} = Test.await_status(instance.id, :suspended, config: config)
+
+    assert {:error, :compensation_required} =
+             Interruptus.cancel(instance.id, config: config.name, compensate: false)
   end
 
   test "suspend persists progress and metadata", %{config: config} do

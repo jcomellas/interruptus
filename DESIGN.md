@@ -69,7 +69,7 @@ Attempt accounting is crash-durable: `attempt_count` is persisted **before** eac
 ### Policies
 
 - **Restart policy** — retry failed segments with backoff before rollback. Applies to all failure modes: `halt/2`, error tuples, raised exceptions, throws, exits, verify failures, and stage timeouts (`stage_timeout` DSL option).
-- **Rollback policy** — LIFO compensation. Compensations attach to checkpoints (`checkpoint compensate: :undo_x do ... end`) and run only for checkpoints the workflow actually **passed**; the workflow-level `rollback_policy compensate: [...]` list is appended after them. Compensation is durable: `compensation_index` is persisted after each completed function, `:compensating` workflows are reclaimable, and a crash mid-compensation resumes from the persisted index. When retries and compensation retries are exhausted (or the plan is empty), the workflow is `:failed`; `Interruptus.resume/2` retries compensation from where it stopped.
+- **Rollback policy** — LIFO compensation over **passed and in-flight** checkpoints (`checkpoint compensate: :undo_x` requires `verify`). The checkpoint at `current_stage_index` is included when it declares `compensate:` (tentative undo for side effects that may have applied before the durable snapshot). Compensations **must be idempotent**. The workflow-level `rollback_policy compensate: [...]` list is appended after them. Progress is persisted per step (`compensation_index`); `:compensating` workflows are reclaimable. Exhaustion yields `:failed`; `Interruptus.resume/2` retries compensation from where it stopped.
 
 ## Lifecycle
 
@@ -78,7 +78,7 @@ stateDiagram-v2
   [*] --> pending: start
   pending --> running: claim
   running --> running: checkpoint / retry / lease reclaim
-  running --> suspended: explicit_suspend or version mismatch
+  running --> suspended: explicit_suspend or identity mismatch
   running --> completed: terminal_success
   running --> failed: attempts exhausted, no compensations
   running --> compensating: attempts exhausted, rollback
@@ -87,16 +87,18 @@ stateDiagram-v2
   compensating --> compensating: step persisted / lease reclaim
   compensating --> compensated: all steps done
   compensating --> failed: compensation exhausted
-  pending --> cancelled: cancel
-  running --> cancelled: cancel (fences live runner)
-  suspended --> cancelled: cancel
-  suspended --> compensating: cancel(compensate true)
+  pending --> cancelled: cancel force or empty plan
+  running --> cancelled: cancel force
+  running --> compensating: cancel default
+  suspended --> cancelled: cancel force or empty plan
+  suspended --> compensating: cancel default
+  compensating --> cancelled: cancel force
   completed --> [*]
   compensated --> [*]
   cancelled --> [*]
 ```
 
-Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`. **Never** `suspended` — suspension is explicit and only `Interruptus.resume/2` (a fenced `suspended → pending` transition) brings it back. `failed` is a resting state: `resume/2` transitions it to `compensating` to retry rollback.
+Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`. **Never** `suspended` — suspension is explicit and only `Interruptus.resume/2` (a fenced `suspended → pending` transition) brings it back. `failed` is a resting quarantine: `resume/2` transitions it to `compensating` to retry rollback. `cancel/2` defaults to `compensate: true`; plain cancel with a non-empty plan requires `force: true`. Cancel while `:compensating` requires `force: true`.
 
 ### Start
 
@@ -107,10 +109,10 @@ Reclaimable by Recovery after lease expiry: `pending`, `running`, `compensating`
 3. Runner claims the row (`FOR UPDATE SKIP LOCKED`), sets `:running`
    (preserving `:compensating` for reclaimed rollbacks), and begins execution
    from `current_stage_index`. A runner that cannot claim stops immediately.
-4. If the persisted `pipeline_version` differs from the compiled module's
-   version, the runner parks the workflow as `:suspended` with reason
-   `"pipeline_version_mismatch"` instead of executing positional indexes
-   against a different pipeline layout.
+4. If the persisted `pipeline_version` or `pipeline_fingerprint` differs from
+   the compiled module, the runner parks the workflow as `:suspended` with
+   reason `"pipeline_version_mismatch"` or `"pipeline_fingerprint_mismatch"`
+   instead of executing positional indexes against a different pipeline layout.
 
 ### Run Segment
 
@@ -155,20 +157,23 @@ Terminal success sets `:completed`. Recovery ignores terminal rows.
 ### Rollback
 
 On failure after restart exhaustion, the compensation plan is computed from
-checkpoints the workflow passed (LIFO) plus the workflow-level list. Entering
-compensation persists the current command snapshot (params/data/errors). Each
-compensation function runs in a supervised task with the same attempt
-accounting; `compensation_index` (and command state) is persisted after each
-completed step. Success ends `:compensated`; exhaustion ends `:failed`
-(resumable to retry compensation when the plan is non-empty). An empty plan
-ends `:failed` directly — nothing was rolled back, so claiming `:compensated`
-would be misleading. `resume/2` on empty-plan `:failed` returns
-`{:error, :not_compensable}`.
+**passed and in-flight** checkpoints (segments `0..current_stage_index`
+inclusive when they declare `compensate:`) plus the workflow-level list, in
+LIFO order. Compensations must be idempotent — the in-flight segment may or
+may not have applied external work. Entering compensation persists the current
+command snapshot (params/data/errors). Each compensation function runs in a
+supervised task with the same attempt accounting; `compensation_index` (and
+command state) is persisted after each completed step. Success ends
+`:compensated`; exhaustion ends `:failed` (resumable to retry compensation
+when the plan is non-empty). An empty plan ends `:failed` directly — nothing
+was rolled back, so claiming `:compensated` would be misleading. `resume/2` on
+empty-plan `:failed` returns `{:error, :not_compensable}`.
 
-`cancel(id, compensate: true)` fences the row to `:compensating`, clears the
-lease, **evicts** any Registry-registered runner, and starts a fresh runner.
-If that start fails, the row remains reclaimable and Recovery finishes
-compensation.
+`cancel/2` defaults to compensation. With a non-empty plan it fences the row
+to `:compensating`, clears the lease, **evicts** any Registry-registered
+runner, and starts a fresh runner. Plain cancel (`compensate: false`) with a
+non-empty plan requires `force: true`. Cancel while `:compensating` requires
+`force: true`. Every successful cancel evicts any live runner.
 
 ## Data Model
 
@@ -186,6 +191,7 @@ erDiagram
     jsonb data
     int current_stage_index
     int pipeline_version
+    string pipeline_fingerprint
     string idempotency_key
     string locked_by
     datetime locked_until
@@ -219,8 +225,10 @@ erDiagram
     uuid id PK
     uuid workflow_id FK
     string effect_key
+    string status
     jsonb metadata
     datetime inserted_at
+    datetime updated_at
   }
 ```
 
@@ -231,7 +239,7 @@ Interruptus embeds in the host Postgres database. Stages run **outside** library
 Implications:
 
 1. Stage side effects and Interruptus checkpoints are **not** one atomic unit.
-2. Between checkpoints, stages and verify may run at-least-once — use idempotent effects, domain unique keys, `verify/1`, and `Interruptus.Effect` markers.
+2. Between checkpoints, stages and verify may run at-least-once — use idempotent effects, domain unique keys, `verify/1`, and `Interruptus.Effect` markers (`pending` → `applied` claim-before-apply).
 3. Do not call `start` / `resume` / `cancel` inside an open transaction on the configured Interruptus repo (`{:error, :in_transaction}`). Nested calls race the Runner against an uncommitted insert.
 4. `lock_version` fences workflow-row writes only. A stale runner after lease expiry can still commit host-table writes.
 5. A dedicated Interruptus Repo/pool (same DB URL) is recommended under load for connection isolation; nesting detection binds to that `:repo`.
@@ -244,7 +252,10 @@ Old runner may still be executing when lease expires. New runner claims with inc
 
 ### Cancel racing a live runner
 
-`cancel/2` bumps the fencing token, so a runner holding a *valid* lease fails its next write and stops; a `:cancelled` workflow can never be resurrected to `:completed`. Cancel internally retries a few times if it races runner writes at segment boundaries.
+`cancel/2` bumps the fencing token and **always evicts** any registered runner.
+Default `compensate: true` starts compensation when the plan is non-empty.
+`compensate: false` with a non-empty plan requires `force: true`. A
+`:cancelled` workflow can never be resurrected to `:completed`.
 
 ### Duplicate verify execution
 
@@ -256,7 +267,15 @@ Recovery reclaims when `locked_until < now()` (or is `NULL`) and status is `:pen
 
 ### Deploy mid-flight
 
-`pipeline_version` is stored on the instance and enforced at claim time: a mismatch parks the workflow as `:suspended` with reason `"pipeline_version_mismatch"` (plus telemetry) instead of silently executing positional stage indexes against a different pipeline. Operators resolve by deploying compatible code and resuming, or cancelling. Recovery also skips instances whose `workflow_type` does not resolve on the scanning node (safe during rolling deploys).
+`pipeline_version` (manual) and `pipeline_fingerprint` (automatic structural
+hash of flattened segments + workflow-level compensations) are stored on the
+instance and enforced at claim time. A mismatch parks the workflow as
+`:suspended` with reason `"pipeline_version_mismatch"` or
+`"pipeline_fingerprint_mismatch"` instead of silently executing positional
+stage indexes against a different pipeline. Operators resolve by deploying
+compatible code and resuming, or cancelling with compensation / force.
+Recovery also parks instances whose `workflow_type` does not resolve on the
+scanning node.
 
 ## API Surface
 
@@ -267,11 +286,11 @@ Interruptus.start(MyApp.TransferFunds, %{from_account_id: "a", ...}, opts)
 # Resume: suspended -> pending (forward) or failed -> compensating (rollback retry)
 Interruptus.resume(workflow_id)
 
-# Cancel a non-terminal workflow (fences live runners)
+# Cancel (defaults to compensate: true; evicts live runners)
 Interruptus.cancel(workflow_id)
 
-# Saga-style cancellation: compensate passed checkpoints, ends :compensated
-Interruptus.cancel(workflow_id, compensate: true)
+# Abandon compensation (operator accepts inconsistent external state)
+Interruptus.cancel(workflow_id, compensate: false, force: true)
 
 # Query status
 Interruptus.status(workflow_id)

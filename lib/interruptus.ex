@@ -168,6 +168,7 @@ defmodule Interruptus do
         data: dumped_data,
         current_stage_index: 0,
         pipeline_version: workflow_module.pipeline_version(),
+        pipeline_fingerprint: workflow_module.pipeline_fingerprint(),
         idempotency_key: idempotency_key
       }
 
@@ -266,12 +267,15 @@ defmodule Interruptus do
 
   The cancel write bumps `lock_version` (fencing token), so a live runner —
   even one holding a valid lease — fails its next write with `:stale_lock`
-  and stops without further side effects on the workflow row.
+  and stops without further side effects on the workflow row. Any registered
+  runner is always evicted after a successful cancel write.
 
-  With `compensate: true` and a non-empty compensation plan, the workflow
-  transitions to `:compensating` instead of `:cancelled`. Any registered
-  runner is evicted and a fresh compensation runner is started. If that
-  start fails, the row remains reclaimable and Recovery finishes the work.
+  **Defaults to `compensate: true`**: when the compensation plan is non-empty,
+  the workflow transitions to `:compensating` instead of `:cancelled`. Pass
+  `compensate: false` with `force: true` to abandon compensation (operator
+  accepts inconsistent external state).
+
+  Cancel while `:compensating` requires `force: true` (`:compensation_in_progress`).
 
   Retries the fenced write a few times when it races runner writes.
 
@@ -282,7 +286,10 @@ defmodule Interruptus do
   ## Options
 
     * `:config` - Interruptus config name atom (default `Interruptus`)
-    * `:compensate` - run compensations for passed checkpoints (default `false`)
+    * `:compensate` - run compensations for passed/in-flight checkpoints
+      (default `true`)
+    * `:force` - allow abandoning compensation or interrupting `:compensating`
+      (default `false`)
 
   ## Returns
 
@@ -290,6 +297,10 @@ defmodule Interruptus do
       `:compensating` when compensating)
     * `{:error, :not_found}` - no row with that id
     * `{:error, :terminal}` - workflow is already terminal
+    * `{:error, :compensation_required}` - plain cancel refused; use default
+      compensate or `force: true`
+    * `{:error, :compensation_in_progress}` - cancel during `:compensating`
+      without `force: true`
     * `{:error, :stale_lock}` - persistent write races; safe to retry
     * `{:error, :in_transaction}` - called inside an open transaction on the
       Interruptus-configured repo
@@ -297,9 +308,11 @@ defmodule Interruptus do
   @spec cancel(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
   def cancel(workflow_id, opts \\ []) do
     config = config_from_opts(opts)
+    compensate? = Keyword.get(opts, :compensate, true)
+    force? = Keyword.get(opts, :force, false)
 
     with :ok <- reject_in_transaction(config) do
-      do_cancel(config, workflow_id, Keyword.get(opts, :compensate, false), @cancel_retries)
+      do_cancel(config, workflow_id, compensate?, force?, @cancel_retries)
     end
   end
 
@@ -387,91 +400,156 @@ defmodule Interruptus do
 
   defp prepare_resume(_config, _workflow_module, instance), do: {:ok, instance}
 
-  @spec do_cancel(Config.t(), Ecto.UUID.t(), boolean(), non_neg_integer()) ::
+  @spec do_cancel(Config.t(), Ecto.UUID.t(), boolean(), boolean(), non_neg_integer()) ::
           {:ok, WorkflowInstance.t()} | {:error, term()}
-  defp do_cancel(_config, _workflow_id, _compensate?, 0), do: {:error, :stale_lock}
+  defp do_cancel(_config, _workflow_id, _compensate?, _force?, 0), do: {:error, :stale_lock}
 
-  defp do_cancel(config, workflow_id, compensate?, retries) do
+  defp do_cancel(config, workflow_id, compensate?, force?, retries) do
     case Store.get(config, workflow_id) do
       nil ->
         {:error, :not_found}
 
       %WorkflowInstance{} = instance ->
-        cond do
-          WorkflowInstance.terminal?(instance) ->
-            {:error, :terminal}
-
-          compensate? ->
-            cancel_with_compensation(config, workflow_id, instance, retries)
-
-          true ->
-            case Store.update_with_lock(config, instance, %{
-                   status: :cancelled,
-                   locked_by: nil,
-                   locked_until: nil
-                 }) do
-              {:ok, cancelled} ->
-                emit_cancelled(workflow_id)
-                {:ok, cancelled}
-
-              {:error, :stale_lock} ->
-                do_cancel(config, workflow_id, compensate?, retries - 1)
+        with {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type),
+             :ok <- validate_cancel(instance, workflow_module, compensate?, force?) do
+          if compensate? do
+            cancel_with_compensation(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+          else
+            plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+          end
+        else
+          {:error, :unknown_workflow_type} = err ->
+            # Allow force plain cancel of unresolvable types.
+            if force? and not compensate? do
+              plain_cancel(config, nil, workflow_id, instance, compensate?, force?, retries)
+            else
+              err
             end
+
+          other ->
+            other
         end
+    end
+  end
+
+  @spec validate_cancel(WorkflowInstance.t(), module(), boolean(), boolean()) ::
+          :ok | {:error, term()}
+  defp validate_cancel(instance, workflow_module, compensate?, force?) do
+    cond do
+      WorkflowInstance.terminal?(instance) ->
+        {:error, :terminal}
+
+      instance.status == :compensating and not force? ->
+        {:error, :compensation_in_progress}
+
+      not compensate? and not force? ->
+        plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
+
+        if plan == [] do
+          :ok
+        else
+          {:error, :compensation_required}
+        end
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec plain_cancel(
+          Config.t(),
+          module() | nil,
+          Ecto.UUID.t(),
+          WorkflowInstance.t(),
+          boolean(),
+          boolean(),
+          non_neg_integer()
+        ) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  defp plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries) do
+    case Store.update_with_lock(config, instance, %{
+           status: :cancelled,
+           locked_by: nil,
+           locked_until: nil
+         }) do
+      {:ok, cancelled} ->
+        emit_cancelled(workflow_id)
+        maybe_replace_runner(config, workflow_module, workflow_id)
+        {:ok, cancelled}
+
+      {:error, :stale_lock} ->
+        do_cancel(config, workflow_id, compensate?, force?, retries - 1)
     end
   end
 
   @spec cancel_with_compensation(
           Config.t(),
+          module(),
           Ecto.UUID.t(),
           WorkflowInstance.t(),
+          boolean(),
+          boolean(),
           non_neg_integer()
         ) ::
           {:ok, WorkflowInstance.t()} | {:error, term()}
-  defp cancel_with_compensation(config, workflow_id, instance, retries) do
-    with {:ok, workflow_module} <- WorkflowType.resolve(instance.workflow_type) do
-      plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
+  defp cancel_with_compensation(
+         config,
+         workflow_module,
+         workflow_id,
+         instance,
+         compensate?,
+         force?,
+         retries
+       ) do
+    plan = Rollback.compensation_plan(workflow_module, instance.current_stage_index)
 
-      if plan == [] do
-        # Nothing to compensate; plain cancel.
-        case Store.update_with_lock(config, instance, %{
-               status: :cancelled,
-               locked_by: nil,
-               locked_until: nil
-             }) do
-          {:ok, cancelled} ->
-            emit_cancelled(workflow_id)
-            {:ok, cancelled}
+    if plan == [] do
+      plain_cancel(config, workflow_module, workflow_id, instance, compensate?, force?, retries)
+    else
+      case Store.update_with_lock(config, instance, %{
+             status: :compensating,
+             attempt_count: 0,
+             locked_by: nil,
+             locked_until: nil,
+             errors: Map.put(instance.errors, "cancelled", "true")
+           }) do
+        {:ok, compensating} ->
+          emit_cancelled(workflow_id)
 
-          {:error, :stale_lock} ->
-            do_cancel(config, workflow_id, true, retries - 1)
-        end
-      else
-        case Store.update_with_lock(config, instance, %{
-               status: :compensating,
-               attempt_count: 0,
-               locked_by: nil,
-               locked_until: nil,
-               errors: Map.put(instance.errors, "cancelled", "true")
-             }) do
-          {:ok, compensating} ->
-            emit_cancelled(workflow_id)
+          case RunnerSupervisor.replace_runner(config, workflow_module, workflow_id) do
+            {:ok, _pid} ->
+              {:ok, compensating}
 
-            case RunnerSupervisor.replace_runner(config, workflow_module, workflow_id) do
-              {:ok, _pid} ->
-                {:ok, compensating}
+            {:error, reason} ->
+              emit_runner_start_failed(workflow_id, :compensating, reason)
+              {:ok, compensating}
+          end
 
-              {:error, reason} ->
-                emit_runner_start_failed(workflow_id, :compensating, reason)
-                # Row is reclaimable (lease cleared); Recovery will start compensation.
-                {:ok, compensating}
-            end
-
-          {:error, :stale_lock} ->
-            do_cancel(config, workflow_id, true, retries - 1)
-        end
+        {:error, :stale_lock} ->
+          do_cancel(config, workflow_id, compensate?, force?, retries - 1)
       end
     end
+  end
+
+  @spec maybe_replace_runner(Config.t(), module() | nil, Ecto.UUID.t()) :: :ok
+  defp maybe_replace_runner(_config, nil, _workflow_id), do: :ok
+
+  defp maybe_replace_runner(config, workflow_module, workflow_id) do
+    # Evict any live runner; do not start a new one for terminal :cancelled.
+    registry = Interruptus.Config.registry_name(config)
+    runner_sup = Interruptus.Config.runner_supervisor_name(config)
+
+    case Registry.lookup(registry, workflow_id) do
+      [{pid, _}] ->
+        _ = DynamicSupervisor.terminate_child(runner_sup, pid)
+        :ok
+
+      [] ->
+        :ok
+    end
+
+    # Silence unused warning when module is only needed for type symmetry.
+    _ = workflow_module
+    :ok
   end
 
   @spec emit_runner_start_failed(Ecto.UUID.t(), atom(), term()) :: :ok
