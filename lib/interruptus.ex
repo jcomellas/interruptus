@@ -317,6 +317,49 @@ defmodule Interruptus do
   end
 
   @doc """
+  Cancels a workflow with compensation (explicit form of the `cancel/2` default).
+
+  Equivalent to `cancel(workflow_id, Keyword.put(opts, :compensate, true))`.
+  """
+  @spec compensate(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  def compensate(workflow_id, opts \\ []) do
+    cancel(workflow_id, Keyword.put(opts, :compensate, true))
+  end
+
+  @doc """
+  Abandons a workflow without compensation.
+
+  Equivalent to `cancel(workflow_id, compensate: false, force: true)` merged
+  with `opts`. Use when an operator accepts inconsistent external state.
+  """
+  @spec abandon(Ecto.UUID.t(), keyword()) :: {:ok, WorkflowInstance.t()} | {:error, term()}
+  def abandon(workflow_id, opts \\ []) do
+    cancel(workflow_id, Keyword.merge(opts, compensate: false, force: true))
+  end
+
+  @doc """
+  Retries compensation for a `:failed` workflow.
+
+  Equivalent to `resume/2` but returns `{:error, :not_failed}` when the
+  instance is not in `:failed` status.
+  """
+  @spec retry_compensation(Ecto.UUID.t(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def retry_compensation(workflow_id, opts \\ []) do
+    config = config_from_opts(opts)
+
+    case Store.get(config, workflow_id) do
+      %WorkflowInstance{status: :failed} ->
+        resume(workflow_id, opts)
+
+      %WorkflowInstance{} ->
+        {:error, :not_failed}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
   Returns the current persisted state of a workflow instance.
 
   ## Arguments

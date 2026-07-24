@@ -164,6 +164,39 @@ defmodule Interruptus.SuspensionTest do
              Interruptus.cancel(instance.id, config: config.name, compensate: false)
   end
 
+  test "compensate/2 and abandon/2 helpers map to cancel intents", %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(ApprovalComp, %{token: "helper-comp"}, config: config.name)
+
+    assert {:ok, _} = Test.await_status(instance.id, :suspended, config: config)
+
+    assert {:ok, %{status: :compensating}} =
+             Interruptus.compensate(instance.id, config: config.name)
+
+    assert {:ok, _} =
+             Test.await_status(instance.id, :compensated, config: config, timeout: 10_000)
+
+    assert {:ok, other} =
+             Interruptus.start(ApprovalComp, %{token: "helper-abandon"}, config: config.name)
+
+    assert {:ok, _} = Test.await_status(other.id, :suspended, config: config)
+
+    assert {:ok, %{status: :cancelled}} =
+             Interruptus.abandon(other.id, config: config.name)
+
+    assert {:error, :terminal} = Interruptus.resume(other.id, config: config.name)
+  end
+
+  test "retry_compensation/2 only accepts :failed workflows", %{config: config} do
+    assert {:ok, instance} =
+             Interruptus.start(ApprovalComp, %{token: "retry-comp"}, config: config.name)
+
+    assert {:ok, _} = Test.await_status(instance.id, :suspended, config: config)
+
+    assert {:error, :not_failed} =
+             Interruptus.retry_compensation(instance.id, config: config.name)
+  end
+
   test "suspend persists progress and metadata", %{config: config} do
     assert {:ok, instance} = Interruptus.start(Suspendable, %{token: "meta"}, config: config.name)
 

@@ -122,8 +122,11 @@ end
   the same data.
 - **Cancel defaults to compensate** — `Interruptus.cancel/2` bumps the fencing
   token, **always evicts** any registered runner, and defaults to
-  `compensate: true`. Plain cancel with a non-empty plan requires
-  `force: true`. Cancel while `:compensating` requires `force: true`.
+  `compensate: true`. Prefer intent helpers: `Interruptus.compensate/2` (same
+  default), `Interruptus.abandon/2` (plain cancel with `force: true`), and
+  `Interruptus.retry_compensation/2` (resume only `:failed` workflows).
+  Plain cancel with a non-empty plan requires `force: true`. Cancel while
+  `:compensating` requires `force: true`.
 - **Long stages and verify are safe** — lease heartbeats renew concurrently with
   segment tasks; `stage_timeout` applies to both stages and `verify/1`.
 - **Start is durable first** — if the workflow row commits but the runner cannot

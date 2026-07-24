@@ -146,6 +146,29 @@ defmodule Interruptus.CompensationTest do
     assert Enum.reverse(CompensateOrder.all()) == [:undo_first, :final_cleanup]
   end
 
+  test "retry_compensation/2 resumes :failed workflows into compensating", %{config: config} do
+    {:ok, instance} =
+      Store.insert_workflow(config, %{
+        workflow_type: "Interruptus.Test.Support.Workflows.Raising",
+        status: :failed,
+        params: %{"id" => "retry-helper"},
+        data: %{"step" => 1},
+        current_stage_index: 1,
+        pipeline_version: 1,
+        pipeline_fingerprint: Interruptus.Test.Support.Workflows.Raising.pipeline_fingerprint(),
+        compensation_index: 0,
+        attempt_count: 2,
+        errors: %{"failure" => "compensation_exhausted"}
+      })
+
+    assert {:ok, _pid} = Interruptus.retry_compensation(instance.id, config: config.name)
+
+    assert {:ok, compensated} =
+             Test.await_status(instance.id, :compensated, config: config, timeout: 10_000)
+
+    assert compensated.compensation_index == 2
+  end
+
   test "failure with no compensations marks the workflow :failed", %{config: config} do
     alias Interruptus.Test.Support.Workflows.NoCompensate
 
